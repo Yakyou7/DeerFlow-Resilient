@@ -1,21 +1,35 @@
-# 🦌 DeerFlow: 工业级长任务自主智能体架构与运行时 Harness
+<div align="center">
+
+# 🦌 DeerFlow-Resilient
+
+**面向复杂长任务的高可靠自主 SuperAgent 框架 (Hardened Fork)**
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](./backend/pyproject.toml)
-[![Framework](https://img.shields.io/badge/编排底座-LangGraph-blue.svg)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/测试用例-132%20通过%20(100%25)-success)](./backend/tests)
+[![编排底座](https://img.shields.io/badge/编排底座-LangGraph-blue.svg)](https://github.com/langchain-ai/langgraph)
+[![测试用例](https://img.shields.io/badge/测试用例-132%20全部通过%20(100%25)-brightgreen)](./backend/tests)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 [English](./README.md) | 中文说明
 
-**DeerFlow** 是一套面向复杂长任务研究、全自动代码工程和跨子任务协同的**高性能自主 SuperAgent 框架**。
-
-项目基于 LangGraph 状态机底座，深度集成了**沙箱隔离执行环境**、**亚毫秒级分层记忆引擎**、**两阶段无损上下文剪枝**以及**静态语法运行时守卫**，从工程底层彻底解决大模型智能体在长时间复杂运行中的“注意力涣散”、“代码写盘崩溃”和“报错死循环”等核心瓶颈。
+</div>
 
 ---
 
-## 🌟 核心架构创新点
+## 📖 项目简介与 Fork 说明
 
-在多达数十轮的复杂长任务中，传统 Agent 方案普遍面临 **上下文膨胀 (Context Rot)**、**向量检索延迟高**、**写坏文件引发级联崩溃** 以及 **相同错误反复死循环 (Doom Loops)** 的痛点。DeerFlow 从三大工程支柱进行了系统性重构：
+**DeerFlow-Resilient** 是基于开源项目 [bytedance/deer-flow](https://github.com/bytedance/deer-flow) 二次重构的高可靠自主智能体工程框架，专为解决 **30 步以上的复杂长任务（Long-Horizon Tasks）** 稳定性而设计。
+
+原生开源 Agent 框架在长时间自主运行中往往面临以下几大致命瓶颈：
+1. **上下文膨胀与注意力涣散 (Context Rot)**：瞬态工具输出与历史失败尝试迅速占满 128k 上下文窗口，导致大模型长程推理能力急剧恶化。
+2. **记忆检索网络高延迟**：外挂向量数据库（Vector DB）产生 150~300ms 网络往返延时与额外的 Embedding Token 账单，且在端口号、配置项与确切路径等专有名词上容易发生模糊漂移。
+3. **代码写盘语法损坏**：大模型偶发截断输出未闭合括号的代码，直接写盘导致后续执行环境直接报语法错误而崩溃。
+4. **报错震荡死循环 (Doom Loops)**：工具执行失败后，模型往往在相同错误上无脑循环尝试，或在 $A \to B \to A \to B$ 工具间来回震荡，空耗 Token。
+
+本 Fork 项目通过**两阶段上下文无损剪枝 (`SummarizationMiddleware`)**、**自研亚毫秒分层记忆引擎 (`AiMem`)**、**AST/JSON 写前语法门禁 (`HarnessGuard`)** 以及 **RFC-003 类型化交接协议 (`TypedHandoff`)**，从底层全面加固智能体的工程可靠性。
+
+---
+
+## 🏛️ 系统架构图
 
 ```mermaid
 flowchart TD
@@ -46,8 +60,10 @@ flowchart TD
 
 ---
 
+## ✨ 核心架构改进与亮点
+
 ### 1. 🚀 上下文工程与工具产物无损剪枝 (Route A / RFC-001)
-* **痛点问题**：长任务运行中堆积了大量中间工具输出（如数十行 `ls`、`cat`、原始 HTTP 日志），快速撑爆上下文窗口并稀释模型的长程推理注意力。
+* **痛点问题**：长任务运行中堆积了大量中间工具输出（数十行 `ls`、`cat`、原始 HTTP 日志），快速撑爆上下文窗口并稀释模型的长程推理注意力。
 * **工程方案**：在 `SummarizationMiddleware` 中引入两阶段压缩。动态剥离中间工具的瞬态原始输出，去重失败重试的陈旧步骤，并将任务进展提炼为不可变的结构化账本。
 * **量化成果**：**单次压缩消除 11,352 Tokens（体积压降 74.8%）**，将长任务有效可用上下文窗口提升 **4.6 倍**。
 
@@ -71,7 +87,7 @@ flowchart TD
 
 以下指标均在真实端到端场景中实测得出：
 
-| 优化维度 | 基准现状 (标准 Agent) | DeerFlow 重构优化后 | 收益提升幅度 |
+| 优化维度 | 基准现状 (标准 Agent) | DeerFlow-Resilient | 收益提升幅度 |
 | :--- | :--- | :--- | :--- |
 | **单次长任务 Token 占用** | 15,178 Tokens | **3,826 Tokens** | **-74.8% (-11,352 Tokens)** |
 | **记忆检索延迟 (Memory RTT)** | 200 ~ 500 ms (向量 API) | **0.936 ms** (本地倒排引擎) | **延时降低 99.5%** |
@@ -97,19 +113,18 @@ flowchart TD
 git clone https://github.com/Yakyou7/deer-flow.git
 cd deer-flow
 
-# 初始化 Python 虚拟环境与锁版本依赖
+# 初始化 Python 虚拟环境与依赖
 cd backend
 uv sync --no-install-project
 ```
 
 ### 3. 配置模型端点
-复制配置文件模板并设置模型 API：
+复制配置文件模板并设置模型 API（支持 OpenAI、DeepSeek、Qwen、Claude 等任何标准端点）：
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-在 `config.yaml` 中配置您的大模型端点（支持 OpenAI 兼容接口，如 DeepSeek、Qwen、Claude 等）：
 ```yaml
 models:
   - name: my-model
@@ -207,6 +222,11 @@ python -m pytest tests/test_harness_guard_middleware.py \
 ```
 
 ---
+
+## 🤝 致谢与血统说明 (Lineage)
+
+- 本项目二次重构自开源项目 [bytedance/deer-flow](https://github.com/bytedance/deer-flow)。
+- 核心编排底座基于 [LangGraph](https://github.com/langchain-ai/langgraph) 与 [LangChain](https://github.com/langchain-ai/langchain)。
 
 ## 📄 开源许可证
 

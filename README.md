@@ -1,21 +1,35 @@
-# 🦌 DeerFlow: Resilient SuperAgent Harness for Long-Horizon Engineering
+<div align="center">
+
+# 🦌 DeerFlow-Resilient
+
+**A Production-Hardened SuperAgent Harness for Long-Horizon Engineering & Research**
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](./backend/pyproject.toml)
 [![Framework](https://img.shields.io/badge/Orchestration-LangGraph-blue.svg)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/Tests-132%20passed%20(100%25)-success)](./backend/tests)
+[![Tests](https://img.shields.io/badge/Tests-132%20passed%20(100%25)-brightgreen)](./backend/tests)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 English | [中文说明](./README_zh.md)
 
-**DeerFlow** is an advanced, production-grade **autonomous SuperAgent framework** designed for long-horizon research, complex software engineering, and multi-step data operations. 
-
-Built on top of LangGraph, DeerFlow integrates **sandboxed execution environments**, an in-process **sub-millisecond hierarchical memory subsystem**, **lossless context pruning**, and **pre-execution runtime guards** to solve the fundamental reliability bottlenecks of autonomous agent loops.
+</div>
 
 ---
 
-## 🌟 Key Architectural Innovations
+## 📖 Project Overview
 
-Standard agent frameworks often suffer from **Context Rot**, **high retrieval latency**, **broken code writes**, and **endless error loops (Doom Loops)** during 20+ step execution. DeerFlow addresses these challenges through three foundational engineering pillars:
+**DeerFlow-Resilient** is an open-source, production-hardened fork of [bytedance/deer-flow](https://github.com/bytedance/deer-flow) re-architected for **complex, long-horizon autonomous tasks** (30+ steps).
+
+While the original framework provided an extensible agent harness with sandboxing, real-world long-running tasks frequently suffer from:
+1. **Context Rot & Token Explosion**: Rapidly depleting the 128k context window with ephemeral tool outputs and repeated failures.
+2. **High-Latency Memory Retrieval**: Vector database search queries incurring 150–300ms network round trips and heavy token costs.
+3. **Syntax-Corrupted Code Writes**: Models emitting truncated Python/JSON payloads, immediately corrupting the execution environment.
+4. **Repetitive & Oscillating Doom Loops**: Agents stuck retrying failing commands or oscillating between tools indefinitely.
+
+This fork systematically addresses these failure modes by introducing **lossless context pruning**, an **in-process sub-millisecond hierarchical memory subsystem (`AiMem`)**, a **pre-write AST/JSON runtime gate (`HarnessGuard`)**, and a **typed subagent handoff protocol (`TypedHandoff`)**.
+
+---
+
+## 🏛️ Architecture Overview
 
 ```mermaid
 flowchart TD
@@ -46,32 +60,34 @@ flowchart TD
 
 ---
 
-### 1. 🚀 Context Engineering & Tool Compaction (Route A / RFC-001)
-* **The Problem**: Long-running agent traces accumulate dozens of bulky tool outputs (`ls`, `cat`, raw HTTP payloads), quickly exhausting the 128k context window and causing severe attention drift.
-* **The Solution**: Multi-stage compaction in `SummarizationMiddleware`. It dynamically strips ephemeral tool outputs, deduplicates historical attempts, and compresses raw execution traces into an immutable structured ledger.
-* **Empirical Impact**: **Cuts 11,352 tokens per compaction cycle (74.8% reduction)**, expanding the usable agent headroom by **4.6x**.
+## ✨ Key Architectural Innovations & Features
+
+### 1. 🚀 Context Engineering & Tool Compaction (RFC-001)
+* **The Problem**: Tool-call logs accumulate thousands of tokens of ephemeral data (`ls`, `cat`, raw HTTP payloads), driving up inference cost and inducing attention drift.
+* **The Solution**: Multi-stage compaction in `SummarizationMiddleware`. It automatically collapses transient tool outputs, prunes obsolete failure attempts, and preserves an immutable structured ledger of key progress.
+* **Empirical Gain**: **-11,352 Tokens per cycle (-74.8%)**, extending effective context headroom by **4.6x**.
 
 ### 2. 🧠 Sub-Millisecond Hierarchical Memory Engine (`AiMem` / RFC-002)
-* **The Problem**: Vector databases introduce heavy cold starts, external network latency (150–300ms RTT), token consumption for embedding generation, and semantic drift on exact entity identifiers (ports, file paths, exact names).
-* **The Solution**: An in-process, three-tier hierarchical memory engine backed by SQLite FTS5 / BM25:
-  * **L1 Thread Cache**: Immediate in-memory working facts.
-  * **L2 Inverted Index**: BM25 keyword matching with exponential recency decay.
-  * **L3 Human-Readable Storage**: Markdown-based persistent facts (`profile`, `entity`, `archive`).
-* **Empirical Impact**: **0.936 ms retrieval latency** with **0 API Token overhead** and 100% exact fact recall.
+* **The Problem**: External vector databases add significant latency (150–300ms RTT), cost extra API tokens per fact query, and often drift on exact identifiers (ports, config paths, exact usernames).
+* **The Solution**: An in-process, three-tier hierarchical memory engine backed by local SQLite FTS5 / BM25:
+  * **L1 Thread Cache**: Immediate working facts and conversational preferences.
+  * **L2 Inverted Index**: Sub-millisecond BM25 keyword matching with exponential recency decay.
+  * **L3 Persistent Store**: Human-readable Markdown facts (`profile`, `entity`, `archive`).
+* **Empirical Gain**: **0.936 ms retrieval latency** with **0 API Token overhead** and 100% exact fact recall.
 
-### 3. 🛡️ HarnessGuard & Resilient Execution (Route C / RFC-003)
-* **Write-Verify Gate**: Intercepts file write tools (`write_file`, `str_replace`, `create_file`) before disk I/O. Verifies Python AST (`ast.parse`) and JSON structure (`json.loads`). Broken code is short-circuited with precise line errors, ensuring **100% syntax-broken write prevention**.
-* **Anti-Doom-Loop State Machine**: Tracks error signatures across a sliding window per `(thread_id, run_id)`. Detects consecutive identical failures ($\ge 2$) and alternating oscillations ($A \to B \to A \to B$), injecting deterministic targeted remediation hints directly into the tool context.
-* **RFC-003 Typed Subagent Handoff (`TypedHandoff`)**: Replaces vague natural language handoffs with structured deliverables (`status`, `deliverables`, `attempted_paths`, `fatal_blocks`). Eliminates 2–3 follow-up verification turns per delegation.
-* **Zero-LLM JIT Dynamic Skill Router (`<1ms`)**: Matches query intent against candidate skill catalogs and injects relevant skills on-demand, saving ~3,000 characters of static system prompt overhead per turn.
+### 3. 🛡️ HarnessGuard Runtime Defense & Anti-Doom-Loop (RFC-003)
+* **Write-Verify Gate**: Intercepts file writes (`write_file`, `str_replace`, `create_file`) before disk I/O. Automatically validates Python AST (`ast.parse`) and JSON syntax (`json.loads`). Syntax-broken payloads are blocked with line-level feedback, achieving **100% write-block prevention**.
+* **Anti-Doom-Loop State Machine**: Tracks error signatures across a thread-safe sliding window. Detects consecutive identical failures ($\ge 2$) and alternating oscillations ($A \to B \to A \to B$), injecting deterministic targeted remediation hints directly into the tool context.
+* **RFC-003 Typed Subagent Handoff (`TypedHandoff`)**: Replaces free-text summaries with structured deliverables (`status`, `deliverables`, `attempted_paths`, `fatal_blocks`). Eliminates 2–3 follow-up verification turns per delegation.
+* **Zero-LLM JIT Dynamic Skill Router (`<1ms`)**: Context-aware dynamic skill activation, pruning 3,000+ characters of static system prompt overhead per turn.
 
 ---
 
 ## 📊 Empirical Benchmarks
 
-All metrics measured on real local execution environments:
+All metrics verified in live end-to-end task environments:
 
-| Optimization Dimension | Baseline (Standard Agent) | DeerFlow Refactored | Empirical Gain |
+| Benchmark Dimension | Standard Agent Baseline | DeerFlow-Resilient | Measured Impact |
 | :--- | :--- | :--- | :--- |
 | **Token Consumption / Cycle** | 15,178 Tokens | **3,826 Tokens** | **-74.8% (-11,352 Tokens)** |
 | **Memory Retrieval Latency** | 200 ~ 500 ms (Vector API) | **0.936 ms** (Local FTS5 Engine) | **>99.5% Latency Drop** |
@@ -79,41 +95,40 @@ All metrics measured on real local execution environments:
 | **Syntax-Corrupted Code Writes** | ~15% (incomplete closing tags) | **0% (100% Pre-write Blocked)** | Zero sandbox corruption |
 | **Subagent Alignment Overhead** | 3 ~ 4 rounds of verification | **1 round (Typed Handoff)** | **60% ~ 75% fewer round trips** |
 | **Dynamic Skill Routing** | Static Prompt (3,000+ chars) | **JIT Active Routing (<1ms)** | Zero static prompt bloat |
-| **Automated Test Suite** | Basic unit tests | **132 / 132 Tests Passed** | **100% Green in 7.04s** |
+| **Automated Test Suite** | Standard tests | **132 / 132 Tests Passed** | **100% Green in 7.04s** |
 
 ---
 
 ## ⚡ Quick Start
 
-### 1. Prerequisites
+### 1. Requirements
 - Python 3.12+
-- `uv` package manager (recommended) or standard `pip`
-- Docker Desktop (optional, for isolated container sandboxes)
+- `uv` (recommended) or `pip`
+- Docker Desktop (optional, for container sandboxes)
 
-### 2. Installation
+### 2. Setup
 
 ```bash
-# Clone your repository
+# Clone the repository
 git clone https://github.com/Yakyou7/deer-flow.git
 cd deer-flow
 
-# Setup virtual environment and dependencies
+# Sync backend virtual environment
 cd backend
 uv sync --no-install-project
 ```
 
-### 3. Configuration
-Copy the configuration template and customize your model endpoint:
+### 3. Model Configuration
+Copy the configuration template and configure your preferred LLM endpoint (OpenAI, DeepSeek, Qwen, Claude, etc.):
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-Configure your models in `config.yaml`:
 ```yaml
 models:
   - name: my-model
-    display_name: Local / Cloud Model
+    display_name: Local / Cloud LLM
     use: langchain_openai:ChatOpenAI
     model: Qwen3.8-Flash
     api_base: http://127.0.0.1:8963/v1
@@ -121,38 +136,38 @@ models:
     context_window: 131072
 ```
 
-### 4. Headless CLI Execution
+### 4. Headless CLI Usage
 
-DeerFlow can be executed directly from your terminal in headless mode:
+DeerFlow can be executed directly from the terminal without web servers:
 
 ```bash
-# One-shot execution (prints final answer)
-uv run --no-sync deerflow --print "Generate a Python script to analyze server access logs in workspace"
+# One-shot execution (outputs final response)
+uv run --no-sync deerflow --print "Write a Python script log_analyzer.py in workspace and run tests"
 
-# Streamed NDJSON execution (outputs full tool-call lifecycle and StreamEvents)
-uv run --no-sync deerflow --json "Build and test a microservice alert policy in workspace"
+# Streaming execution (emits structured StreamEvents and real-time tool logs)
+uv run --no-sync deerflow --json "Build and verify an automated microservice alert rule"
 ```
 
 ---
 
-## 💻 Programmatic Usage: Embedded Client
+## 💻 Embedded Python SDK (`DeerFlowClient`)
 
-DeerFlow provides a lightweight, embeddable Python client (`DeerFlowClient`) that runs without spinning up external servers or web gateways:
+Run the SuperAgent directly inside your own Python code or pipeline:
 
 ```python
 from deerflow.client import DeerFlowClient
 
-# Initialize client with subagent capabilities enabled
+# Initialize client with subagent delegation & runtime guards
 client = DeerFlowClient(subagent_enabled=True)
 
-# Stream multi-step autonomous execution
+# Run an autonomous multi-step goal
 prompt = (
-    "1. Delegate to general-purpose subagent to create a 20-row sample_logs.txt.\n"
-    "2. Write a Python script log_analyzer.py to calculate 5xx error ratios.\n"
-    "3. Execute the script in the workspace and write findings to summary.json."
+    "1. Delegate to general-purpose subagent to generate server_access.log.\n"
+    "2. Write log_analyzer.py to calculate error rates and P95 latency.\n"
+    "3. Run the script in the workspace and output summary.json."
 )
 
-for event in client.stream(prompt, thread_id="session-001", recursion_limit=100):
+for event in client.stream(prompt, thread_id="session-01", recursion_limit=100):
     if event.type == "messages-tuple" and event.data.get("type") == "ai":
         content = event.data.get("content", "")
         if content:
@@ -187,9 +202,9 @@ deer-flow/
 
 ---
 
-## 🧪 Testing & Verification
+## 🧪 Comprehensive Verification Suite
 
-DeerFlow features an enterprise-grade automated test suite with **132 test cases** covering concurrency, adversarial XML injection, ReDoS, memory eviction, and multi-agent E2E workflows:
+DeerFlow-Resilient includes an automated test suite with **132 test cases** covering concurrency (50 threads), adversarial XML injection, ReDoS, memory eviction, and multi-agent E2E workflows:
 
 ```bash
 cd backend
@@ -202,10 +217,15 @@ python -m pytest tests/test_harness_guard_middleware.py \
                  tests/test_route_c_stress_and_boundaries.py \
                  tests/test_route_c_e2e_live.py
 
-# Output: 132 passed in 7.04s (100% Pass Rate)
+# Result: 132 passed in 7.04s (100% Pass Rate)
 ```
 
 ---
+
+## 🤝 Acknowledgments & Lineage
+
+- Forked from the open-source [bytedance/deer-flow](https://github.com/bytedance/deer-flow) architecture.
+- Powered by [LangGraph](https://github.com/langchain-ai/langgraph) & [LangChain](https://github.com/langchain-ai/langchain).
 
 ## 📄 License
 
