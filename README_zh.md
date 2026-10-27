@@ -32,30 +32,59 @@
 ## 🏛️ 系统架构图
 
 ```mermaid
-flowchart TD
-    User["用户复合任务 / Prompt"] --> Router["DynamicSkillRouter (零 LLM 毫秒级意图路由)"]
-    Router --> Lead["主智能体 (Lead Agent / LangGraph)"]
-    
-    subgraph Reliability["运行时防御与上下文工程层 (Harness Layer)"]
-        Guard["HarnessGuardMiddleware (写前 AST/JSON 门禁 & 防死循环状态机)"]
-        Summarizer["SummarizationMiddleware (瞬态工具产物无损剪枝: -11k Tokens)"]
-        Memory["AiMem 分层记忆子系统 (L1 缓存 / L2 倒排索引 / L3 存储: 0.936ms)"]
+flowchart TB
+    %% 意图与流量接入层
+    subgraph INGRESS [" 📥 流量接入与意图路由层 "]
+        direction TB
+        User(["👤 用户复合任务 / Prompt"]):::ingressNode
+        Router["⚡ DynamicSkillRouter<br/><code>零 LLM 毫秒级意图路由 (&lt;1ms)</code>"]:::ingressNode
     end
-    
-    Lead --> Guard
-    Lead --> Summarizer
-    Lead --> Memory
-    
-    subgraph Execution["执行环境与多智能体协同"]
-        Subagent["子智能体集群 (general-purpose / bash)"]
-        Handoff["RFC-003 TypedHandoff 类型化交接协议 (结构化 Deliverables)"]
-        Sandbox["沙箱工作区 (/mnt/user-data/workspace)"]
+
+    %% 核心编排引擎
+    subgraph ORCHESTRATION [" 🧠 核心编排与思考引擎 "]
+        direction TB
+        Lead["🦌 主智能体运行时 (Lead Agent)<br/><code>LangGraph 状态图 &middot; ReAct 规划循环</code>"]:::coreNode
     end
+
+    %% 运行时防御与上下文层
+    subgraph RELIABILITY [" 🛡️ 运行时防御与上下文工程层 (Harness Layer) "]
+        direction TB
+        Guard["🛡️ HarnessGuard 运行时门禁<br/><code>写前 AST 与 JSON 语法预检</code><br/><code>防死循环有限状态机 (Anti-Doom-Loop)</code>"]:::defenseNode
+        Summarizer["📉 上下文无损剪枝器<br/><code>瞬态工具产物动态压缩 (-74.8% Tokens)</code><br/><code>不可变任务进展结构化账本</code>"]:::defenseNode
+        Memory["⚡ AiMem 分层记忆子系统<br/><code>L1 会话缓存 &middot; L2 本地倒排索引 (0.936ms)</code><br/><code>L3 Markdown 结构化持久存储</code>"]:::memoryNode
+    end
+
+    %% 执行环境与沙箱
+    subgraph EXECUTION [" ⚙️ 执行环境与多智能体协同 "]
+        direction TB
+        Subagent["🤖 子智能体集群 (Subagents)<br/><code>general-purpose &middot; bash</code>"]:::execNode
+        Handoff["📋 RFC-003 类型化交接协议<br/><code>TypedHandoff 确定性结构化交付</code>"]:::execNode
+        Sandbox["📦 沙箱工作区环境<br/><code>/mnt/user-data/workspace</code>"]:::execNode
+        Blocked(["🚫 Harness Guard 语法熔断<br/><code>语法损坏拦截 &middot; 注入针对性修复提示</code>"]):::blockedNode
+    end
+
+    %% 跨层调用与流转
+    User ==> Router
+    Router ==> Lead
     
-    Guard -->|AST 验证通过| Sandbox
-    Guard -->|语法损坏| ShortCircuit["[HARNESS GUARD: 拦截写盘并注入提示]"]
-    Lead -->|task 派发| Subagent
-    Subagent --> Handoff --> Lead
+    Lead <==> Summarizer
+    Lead <==> Memory
+    Lead ==> Guard
+    
+    Guard -->|"✅ AST / JSON 预检通过"| Sandbox
+    Guard -.->|"❌ 语法损坏或循环震荡"| Blocked
+    
+    Lead -->|"任务委派派发"| Subagent
+    Subagent -->|"契约化交付"| Handoff
+    Handoff -->|"结构化结论回传"| Lead
+
+    %% 视觉主题配色定义
+    classDef ingressNode fill:#EEF2FF,stroke:#6366F1,stroke-width:2px,color:#1E1B4B;
+    classDef coreNode fill:#EDE9FE,stroke:#8B5CF6,stroke-width:2.5px,color:#2E1065;
+    classDef defenseNode fill:#ECFDF5,stroke:#10B981,stroke-width:2px,color:#064E3B;
+    classDef memoryNode fill:#E0F2FE,stroke:#0284C7,stroke-width:2px,color:#0C4A6E;
+    classDef execNode fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F;
+    classDef blockedNode fill:#FEE2E2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D,stroke-dasharray: 4 4;
 ```
 
 ---
@@ -110,8 +139,8 @@ flowchart TD
 
 ```bash
 # 克隆代码仓库
-git clone https://github.com/Yakyou7/deer-flow.git
-cd deer-flow
+git clone https://github.com/Yakyou7/DeerFlow-Resilient.git
+cd DeerFlow-Resilient
 
 # 初始化 Python 虚拟环境与依赖
 cd backend

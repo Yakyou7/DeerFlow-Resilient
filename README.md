@@ -32,30 +32,59 @@ This fork systematically addresses these failure modes by introducing **lossless
 ## 🏛️ Architecture Overview
 
 ```mermaid
-flowchart TD
-    User["User Task / Prompt"] --> Router["DynamicSkillRouter (Zero-LLM JIT <1ms)"]
-    Router --> Lead["Lead Agent (LangGraph Runtime)"]
-    
-    subgraph Reliability["Runtime Defense & Context Engineering Layer"]
-        Guard["HarnessGuardMiddleware (Pre-Write AST/JSON Gate & Anti-Doom-Loop)"]
-        Summarizer["SummarizationMiddleware (Lossless Tool Compaction: -11k Tokens)"]
-        Memory["AiMem Engine (L1 Cache / L2 Inverted Index / L3 Storage: 0.936ms)"]
+flowchart TB
+    %% Ingress & Intent
+    subgraph INGRESS [" 📥 INGRESS & INTENT LAYER "]
+        direction TB
+        User(["👤 User Task / Client Prompt"]):::ingressNode
+        Router["⚡ DynamicSkillRouter<br/><code>Zero-LLM JIT Intent Matching (&lt;1ms)</code>"]:::ingressNode
     end
-    
-    Lead --> Guard
-    Lead --> Summarizer
-    Lead --> Memory
-    
-    subgraph Execution["Execution & Subagent Ecosystem"]
-        Subagent["Subagents (general-purpose / bash)"]
-        Handoff["RFC-003 TypedHandoff Protocol (Structured Deliverables)"]
-        Sandbox["Sandboxed Workspace (/mnt/user-data/workspace)"]
+
+    %% Core Agent
+    subgraph ORCHESTRATION [" 🧠 CORE REASONING ENGINE "]
+        direction TB
+        Lead["🦌 Lead Agent Runtime<br/><code>LangGraph StateGraph &middot; ReAct Planning Loop</code>"]:::coreNode
     end
+
+    %% Reliability & Harness Layer
+    subgraph RELIABILITY [" 🛡️ RUNTIME DEFENSE & CONTEXT HARNESS LAYER "]
+        direction TB
+        Guard["🛡️ HarnessGuard Gate<br/><code>AST &amp; JSON Syntax Pre-check</code><br/><code>Anti-Doom-Loop Finite State Machine</code>"]:::defenseNode
+        Summarizer["📉 Context Compactor<br/><code>Lossless Tool Pruning (-74.8% Tokens)</code><br/><code>Structured Progress Ledger</code>"]:::defenseNode
+        Memory["⚡ AiMem Engine<br/><code>L1 Working Cache &middot; L2 BM25 Index (0.936ms)</code><br/><code>L3 Markdown Persistent Store</code>"]:::memoryNode
+    end
+
+    %% Execution & Sandboxing
+    subgraph EXECUTION [" ⚙️ EXECUTION & SUBAGENT WORKSPACE "]
+        direction TB
+        Subagent["🤖 Subagent Cluster<br/><code>general-purpose &middot; bash</code>"]:::execNode
+        Handoff["📋 RFC-003 TypedHandoff<br/><code>Structured Deliverables Protocol</code>"]:::execNode
+        Sandbox["📦 Sandboxed Workspace<br/><code>/mnt/user-data/workspace</code>"]:::execNode
+        Blocked(["🚫 Harness Guard Block<br/><code>Syntax Error &middot; Injected Remediation</code>"]):::blockedNode
+    end
+
+    %% Inter-layer Connections
+    User ==> Router
+    Router ==> Lead
     
-    Guard -->|Valid Write| Sandbox
-    Guard -->|AST Broken| ShortCircuit["[HARNESS GUARD: WRITE BLOCKED]"]
-    Lead -->|task delegation| Subagent
-    Subagent --> Handoff --> Lead
+    Lead <==> Summarizer
+    Lead <==> Memory
+    Lead ==> Guard
+    
+    Guard -->|"✅ AST / JSON Valid"| Sandbox
+    Guard -.->|"❌ Syntax Corrupted"| Blocked
+    
+    Lead -->|"Task Delegation"| Subagent
+    Subagent -->|"Structured Contract"| Handoff
+    Handoff -->|"Verified Results"| Lead
+
+    %% Visual Styling
+    classDef ingressNode fill:#EEF2FF,stroke:#6366F1,stroke-width:2px,color:#1E1B4B;
+    classDef coreNode fill:#EDE9FE,stroke:#8B5CF6,stroke-width:2.5px,color:#2E1065;
+    classDef defenseNode fill:#ECFDF5,stroke:#10B981,stroke-width:2px,color:#064E3B;
+    classDef memoryNode fill:#E0F2FE,stroke:#0284C7,stroke-width:2px,color:#0C4A6E;
+    classDef execNode fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F;
+    classDef blockedNode fill:#FEE2E2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D,stroke-dasharray: 4 4;
 ```
 
 ---
@@ -110,8 +139,8 @@ All metrics verified in live end-to-end task environments:
 
 ```bash
 # Clone the repository
-git clone https://github.com/Yakyou7/deer-flow.git
-cd deer-flow
+git clone https://github.com/Yakyou7/DeerFlow-Resilient.git
+cd DeerFlow-Resilient
 
 # Sync backend virtual environment
 cd backend
