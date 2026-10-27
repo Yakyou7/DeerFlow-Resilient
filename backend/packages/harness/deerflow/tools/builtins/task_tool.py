@@ -713,6 +713,13 @@ def _task_result_command(
         # RFC #4651 PR4: the rendered checklist rides the model-visible result
         # text; metadata carries the structured verdict for the ledger/judge.
         content = f"{content}\n\n{render_acceptance_section(acceptance_verdict)}"
+
+    # RFC-003: Typed Subagent Handoff Protocol
+    from deerflow.subagents.typed_handoff import parse_typed_handoff, render_handoff_section
+
+    handoff = parse_typed_handoff(result or error or "", status=status, tool_receipts=tool_receipts)
+    content = f"{content}\n\n{render_handoff_section(handoff)}"
+
     artifact = cited_source_artifact(source_messages or [], content, include_omissions=True)
     if knowledge_sources:
         from deerflow.knowledge.sources import forward_sources
@@ -741,6 +748,7 @@ def _task_result_command(
                         tool_receipts=tool_receipts,
                         receipt_verdict=receipt_verdict,
                         acceptance_verdict=acceptance_verdict,
+                        handoff=handoff.model_dump(),
                     ),
                 )
             ]

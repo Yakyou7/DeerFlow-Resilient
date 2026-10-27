@@ -37,6 +37,7 @@ MAX_CRITERION_CHARS = 500
 
 _HANDLES_LINE = "- Attach a verifiable handle to every deliverable: absolute file path, URL, record ID, or HTTP status."
 _HONESTY_LINE = "- State explicitly what failed, was skipped, or remains uncertain — never claim an action you did not execute."
+_HANDOFF_LINE = "- Conclude with a structured <handoff> block detailing deliverables, attempted paths, and any fatal blockers (RFC-003)."
 
 
 def build_report_contract_section(*, receipts_enabled: bool = True) -> str:
@@ -85,6 +86,7 @@ def build_report_contract_section(*, receipts_enabled: bool = True) -> str:
     else:
         lines.append(_HANDLES_LINE)
         lines.append(_HONESTY_LINE)
+    lines.append(_HANDOFF_LINE)
     lines.append("</report_contract>")
     return "\n".join(lines)
 
