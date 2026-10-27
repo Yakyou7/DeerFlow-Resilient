@@ -31,6 +31,17 @@
 
 ## 🏛️ 系统架构图
 
+<p align="center">
+  <img src="./docs/assets/architecture.png" alt="DeerFlow-Resilient 系统架构总览" width="100%" />
+</p>
+
+<p align="center">
+  <em>架构图基于 Excalidraw 手绘工程白板设计导出。源文件：<a href="./docs/assets/architecture.excalidraw">architecture.excalidraw</a></em>
+</p>
+
+<details>
+<summary><b>📐 点击展开文本原理图与 Mermaid 源码</b></summary>
+
 ```mermaid
 flowchart TB
     %% 意图与流量接入层
@@ -86,6 +97,8 @@ flowchart TB
     classDef execNode fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F;
     classDef blockedNode fill:#FEE2E2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D,stroke-dasharray: 4 4;
 ```
+
+</details>
 
 ---
 

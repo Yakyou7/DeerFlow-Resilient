@@ -31,6 +31,17 @@ This fork systematically addresses these failure modes by introducing **lossless
 
 ## 🏛️ Architecture Overview
 
+<p align="center">
+  <img src="./docs/assets/architecture.png" alt="DeerFlow-Resilient System Architecture" width="100%" />
+</p>
+
+<p align="center">
+  <em>Visual diagram generated with Excalidraw hand-drawn architecture layout. Source: <a href="./docs/assets/architecture.excalidraw">architecture.excalidraw</a></em>
+</p>
+
+<details>
+<summary><b>📐 View Text Schematic & Mermaid Source</b></summary>
+
 ```mermaid
 flowchart TB
     %% Ingress & Intent
@@ -86,6 +97,8 @@ flowchart TB
     classDef execNode fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F;
     classDef blockedNode fill:#FEE2E2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D,stroke-dasharray: 4 4;
 ```
+
+</details>
 
 ---
 
