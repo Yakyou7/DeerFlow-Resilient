@@ -101,6 +101,20 @@ class SummarizationConfig(BaseModel):
         default_factory=lambda: list(DEFAULT_SKILL_FILE_READ_TOOL_NAMES),
         description="Tool names treated as skill-file reads when capturing loaded skills into the durable skill_context channel.",
     )
+    prune_tool_outputs: bool = Field(
+        default=True,
+        description="Whether to prune older verbose tool outputs in preserved context to avoid context bloat.",
+    )
+    max_tool_output_chars: int = Field(
+        default=300,
+        ge=50,
+        description="Maximum characters to keep for older tool outputs in preserved context.",
+    )
+    keep_recent_tool_turns: int = Field(
+        default=2,
+        ge=0,
+        description="Number of most recent tool turns to keep completely unpruned.",
+    )
 
 
 # Global configuration instance

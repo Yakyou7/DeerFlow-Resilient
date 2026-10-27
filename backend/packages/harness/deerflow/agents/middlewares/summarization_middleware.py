@@ -15,7 +15,7 @@ from typing import Any, Protocol, override, runtime_checkable
 from deerflow_extension_api import CompactionEvent, canonical_hash
 from langchain.agents import AgentState
 from langchain.agents.middleware import SummarizationMiddleware
-from langchain_core.messages import AnyMessage, HumanMessage, RemoveMessage, SystemMessage, get_buffer_string
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage, get_buffer_string
 from langgraph.config import get_config
 from langgraph.constants import TAG_NOSTREAM
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -128,9 +128,15 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         anchor_model_name: str | None = _UNSET,  # type: ignore[assignment]
         prebuilt_models: Mapping[str | None, Any | None] | None = None,
         extensions=None,
+        prune_tool_outputs: bool = True,
+        max_tool_output_chars: int = 300,
+        keep_recent_tool_turns: int = 2,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._prune_tool_outputs = prune_tool_outputs
+        self._max_tool_output_chars = max_tool_output_chars
+        self._keep_recent_tool_turns = keep_recent_tool_turns
         self._task_continuity_config = task_continuity_config if task_continuity_config is not None and task_continuity_config.enabled is True else None
         self._before_summarization_hooks = before_summarization or []
         # Model-ownership state. The model that actually executes the run is selected
@@ -761,6 +767,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         messages_to_summarize, preserved_messages = self._preserve_required_context(messages_to_summarize, preserved_messages, latest_user_id=latest_user_id)
         if not messages_to_summarize:
             return None
+        preserved_messages = self._prune_preserved_tool_outputs(preserved_messages)
         return messages_to_summarize, preserved_messages, previous_summary, total_tokens
 
     def _freeze_compaction_sources(self, messages_to_summarize: list[AnyMessage]) -> tuple[str, ...]:
@@ -1014,6 +1021,76 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 remaining.append(msg)
         return remaining, rescued + preserved_messages
 
+    def _prune_preserved_tool_outputs(self, preserved_messages: list[AnyMessage]) -> list[AnyMessage]:
+        """Prune older verbose ToolMessages in preserved_messages to prevent context bloat."""
+        if not getattr(self, "_prune_tool_outputs", True):
+            return preserved_messages
+        tool_indices = [i for i, m in enumerate(preserved_messages) if isinstance(m, ToolMessage)]
+        if not tool_indices:
+            return preserved_messages
+
+        keep_recent = getattr(self, "_keep_recent_tool_turns", 2)
+        protected_indices = set(tool_indices[-keep_recent:]) if keep_recent > 0 else set()
+        max_chars = getattr(self, "_max_tool_output_chars", 300)
+
+        result: list[AnyMessage] = []
+        for i, m in enumerate(preserved_messages):
+            if i in protected_indices or not isinstance(m, ToolMessage):
+                result.append(m)
+                continue
+
+            content = m.content
+            if isinstance(content, str) and len(content) > max_chars:
+                pruned_content = (
+                    f"{content[:120]}\n"
+                    f"... [Output truncated: {len(content)} chars total, tool={m.name or 'unknown'}]"
+                )
+                pruned_msg = ToolMessage(
+                    content=pruned_content,
+                    name=m.name,
+                    tool_call_id=m.tool_call_id,
+                    id=m.id,
+                    artifact=getattr(m, "artifact", None),
+                    status=getattr(m, "status", "success"),
+                    additional_kwargs=dict(m.additional_kwargs) if getattr(m, "additional_kwargs", None) else {},
+                )
+                result.append(pruned_msg)
+            else:
+                result.append(m)
+        return result
+
+    @override
+    def _should_summarize_based_on_reported_tokens(self, messages: list[AnyMessage], threshold: float) -> bool:
+        """Check if reported token usage from last AIMessage exceeds threshold.
+
+        Overrides LangChain default to support OpenAI-compatible endpoints that return
+        valid usage_metadata but omit 'model_provider' in response_metadata.
+        """
+        last_ai_message = next(
+            (msg for msg in reversed(messages) if isinstance(msg, AIMessage)),
+            None,
+        )
+        if not isinstance(last_ai_message, AIMessage) or last_ai_message.usage_metadata is None:
+            return False
+
+        reported_tokens = last_ai_message.usage_metadata.get("total_tokens")
+        if reported_tokens is None or reported_tokens < 0:
+            reported_tokens = last_ai_message.usage_metadata.get("input_tokens", -1)
+
+        if reported_tokens < threshold:
+            return False
+
+        message_provider = (getattr(last_ai_message, "response_metadata", None) or {}).get("model_provider")
+        if message_provider is not None:
+            from langchain.agents.middleware.summarization import _provider_matches
+
+            ls_params = getattr(self.model, "_get_ls_params", lambda: {})()
+            ls_provider = ls_params.get("ls_provider") if isinstance(ls_params, dict) else None
+            if ls_provider and not _provider_matches(message_provider, ls_provider):
+                return False
+
+        return True
+
     def _fire_hooks(
         self,
         messages_to_summarize: list[AnyMessage],
@@ -1254,6 +1331,9 @@ def create_summarization_middleware(
         "trigger": trigger,
         "keep": keep_tuple,
         "trim_tokens_to_summarize": config.trim_tokens_to_summarize,
+        "prune_tool_outputs": getattr(config, "prune_tool_outputs", True),
+        "max_tool_output_chars": getattr(config, "max_tool_output_chars", 300),
+        "keep_recent_tool_turns": getattr(config, "keep_recent_tool_turns", 2),
     }
     if config.summary_prompt is not None:
         kwargs["summary_prompt"] = config.summary_prompt

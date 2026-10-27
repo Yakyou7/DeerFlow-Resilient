@@ -59,6 +59,7 @@ SUBAGENT_TOKEN_USAGE_KEY = "subagent_token_usage"
 SUBAGENT_TOOL_RECEIPTS_KEY = "subagent_tool_receipts"
 SUBAGENT_RECEIPT_VERDICT_KEY = "subagent_receipt_verdict"
 SUBAGENT_ACCEPTANCE_VERDICT_KEY = "subagent_acceptance_verdict"
+SUBAGENT_HANDOFF_KEY = "subagent_handoff"
 SUBAGENT_METADATA_TEXT_MAX_CHARS = 2000
 
 #: The producer always emits ``hashlib.sha256(...).hexdigest()`` — 64
@@ -162,6 +163,7 @@ def make_subagent_additional_kwargs(
     tool_receipts: list[dict[str, Any]] | None = None,
     receipt_verdict: Mapping[str, object] | None = None,
     acceptance_verdict: Mapping[str, object] | None = None,
+    handoff: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build the ``additional_kwargs`` payload the middleware stamps.
 
@@ -205,6 +207,8 @@ def make_subagent_additional_kwargs(
     validated_acceptance = validate_acceptance_verdict(acceptance_verdict)
     if validated_acceptance is not None:
         payload[SUBAGENT_ACCEPTANCE_VERDICT_KEY] = validated_acceptance
+    if isinstance(handoff, Mapping) and handoff:
+        payload[SUBAGENT_HANDOFF_KEY] = dict(handoff)
     return payload
 
 
