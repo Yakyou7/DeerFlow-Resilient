@@ -139,3 +139,88 @@ def test_reported_tokens_with_matching_and_mismatching_provider():
         usage_metadata={"input_tokens": 33000, "output_tokens": 200, "total_tokens": 33200},
     )
     assert middleware._should_summarize_based_on_reported_tokens([ai_mismatching], 32000.0) is False
+
+
+def test_tool_pruning_multimodal_list_blocks():
+    middleware = _mock_middleware(
+        prune_tool_outputs=True,
+        max_tool_output_chars=100,
+        keep_recent_tool_turns=0,
+    )
+    blocks = [
+        {"type": "text", "text": "A" * 600},
+        {"type": "image_url", "image_url": "https://example.com/test.png"},
+    ]
+    t1 = ToolMessage(
+        content=blocks,
+        tool_call_id="call_multi",
+        name="browser",
+        id="msg_multi",
+        response_metadata={"execution_time": 0.42},
+    )
+    pruned = middleware._prune_preserved_tool_outputs([t1])
+    assert len(pruned) == 1
+    out_content = pruned[0].content
+    assert isinstance(out_content, list)
+    # First block text truncated
+    assert len(out_content[0]["text"]) <= 50
+    # Image block preserved
+    assert out_content[1] == {"type": "image_url", "image_url": "https://example.com/test.png"}
+    # Truncation banner block appended
+    assert "[Output truncated: 600 chars total, tool=browser]" in out_content[2]["text"]
+    # Metadata preserved
+    assert pruned[0].response_metadata == {"execution_time": 0.42}
+
+
+def test_tool_pruning_parallel_calls_in_same_turn():
+    middleware = _mock_middleware(
+        prune_tool_outputs=True,
+        max_tool_output_chars=100,
+        keep_recent_tool_turns=1,
+    )
+    ai_turn = AIMessage(
+        content="calling two tools in parallel",
+        id="ai_p",
+        tool_calls=[
+            {"id": "call_p1", "name": "f1", "args": {}},
+            {"id": "call_p2", "name": "f2", "args": {}},
+        ],
+    )
+    t1 = ToolMessage(content="X" * 500, tool_call_id="call_p1", name="f1", id="tp1")
+    t2 = ToolMessage(content="Y" * 500, tool_call_id="call_p2", name="f2", id="tp2")
+
+    preserved = [ai_turn, t1, t2]
+    pruned = middleware._prune_preserved_tool_outputs(preserved)
+
+    # Both parallel tool calls belong to the same most recent turn, so BOTH must be kept intact
+    assert pruned[1].content == "X" * 500
+    assert pruned[2].content == "Y" * 500
+
+
+def test_tool_pruning_dynamic_prefix_bounding():
+    middleware = _mock_middleware(
+        prune_tool_outputs=True,
+        max_tool_output_chars=80,
+        keep_recent_tool_turns=0,
+    )
+    # 90 characters of text
+    content_90 = "K" * 90
+    t1 = ToolMessage(content=content_90, tool_call_id="c_short", name="bash", id="t_short")
+    pruned = middleware._prune_preserved_tool_outputs([t1])
+
+    # Prefix is dynamically bounded by min(120, max(20, 80 // 2)) == 40
+    # So the prefix length is exactly 40, preventing reverse expansion beyond 120
+    first_line = pruned[0].content.split("\n")[0]
+    assert len(first_line) == 40
+
+
+def test_reported_tokens_malformed_type_guard():
+    middleware = _mock_middleware()
+    ai_msg_str = AIMessage(content="calling tool")
+    object.__setattr__(ai_msg_str, "usage_metadata", {"input_tokens": "N/A", "total_tokens": "unknown"})
+    # Should not raise TypeError and return False safely
+    assert middleware._should_summarize_based_on_reported_tokens([ai_msg_str], 32000.0) is False
+
+    ai_msg_none = AIMessage(content="calling tool")
+    object.__setattr__(ai_msg_none, "usage_metadata", {"input_tokens": None, "total_tokens": None})
+    assert middleware._should_summarize_based_on_reported_tokens([ai_msg_none], 32000.0) is False

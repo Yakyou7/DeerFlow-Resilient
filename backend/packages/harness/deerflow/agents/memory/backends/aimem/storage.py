@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,24 +23,25 @@ from .config import AimemConfig
 # - [fact_id] content
 _FACT_LINE_REGEX = re.compile(r"^\s*-\s*(?:\[(?P<id>[a-zA-Z0-9_-]+)\])?\s*(?P<content>.+?)(?:\s*<!--\s*(?P<meta>[^>]+)\s*-->)?\s*$")
 
-# Common topic prefixes used for detecting superseding facts
-_SUPERSEDING_PREFIXES = [
-    re.compile(r"^(?:my\s+)?favorite\s+(?P<topic>\w+)\s+is\s+", re.IGNORECASE),
-    re.compile(r"^(?:user\s+)?prefers?\s+(?P<topic>\w+)\s+(?:over|instead\s+of)?", re.IGNORECASE),
-    re.compile(r"^(?:my\s+)?preferred\s+(?P<topic>\w+)\s+is\s+", re.IGNORECASE),
-    re.compile(r"^(?:user\s+)?timezone\s+is\s+", re.IGNORECASE),
-    re.compile(r"^项目(?:采用|使用|依赖)\s*(?P<topic>\w+)", re.IGNORECASE),
+# Canonical topic domain mappings for detecting superseding facts
+_SUPERSEDING_DOMAINS = [
+    ("preference", re.compile(r"^(?:that\s+)?(?:my\s+)?favorite\s+(?P<topic>\w+)\s+is\s+", re.IGNORECASE)),
+    ("preference", re.compile(r"^(?:that\s+)?(?:user\s+)?prefers?\s+(?P<topic>\w+)\s+(?:over|instead\s+of)?", re.IGNORECASE)),
+    ("preference", re.compile(r"^(?:that\s+)?(?:my\s+)?preferred\s+(?P<topic>\w+)\s+is\s+", re.IGNORECASE)),
+    ("timezone", re.compile(r"^(?:that\s+)?(?:user\s+)?timezone\s+is\s+", re.IGNORECASE)),
+    ("project_tech", re.compile(r"^项目(?:采用|使用|依赖)\s*(?P<topic>\w+)", re.IGNORECASE)),
+    ("preference", re.compile(r"^(?:我的偏好是|我喜欢|我不喜欢|我的习惯是)\s*[:：]?\s*(?P<topic>\w+)", re.IGNORECASE)),
 ]
 
 
 def _extract_topic_key(content: str) -> str | None:
     """Extract a canonical topic key to identify contradictory / superseding facts."""
     norm = content.strip().lower()
-    for pattern in _SUPERSEDING_PREFIXES:
+    for domain, pattern in _SUPERSEDING_DOMAINS:
         m = pattern.search(norm)
         if m:
-            topic = m.groupdict().get("topic")
-            return f"{pattern.pattern[:15]}:{topic or 'general'}"
+            topic = m.groupdict().get("topic") or "general"
+            return f"{domain}:{topic.strip().lower()}"
     return None
 
 
@@ -75,12 +77,25 @@ class MarkdownStorage:
     def __init__(self, config: AimemConfig) -> None:
         self.config = config
         base = Path(config.storage_path) if config.storage_path else Path(".deer-flow")
-        self.root_dir = base / "aimem" / "users"
+        self.root_dir = (base / "aimem" / "users").resolve()
         self.root_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
     def _user_dir(self, user_id: str) -> Path:
-        safe_user = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", user_id or "default")
-        path = self.root_dir / safe_user
+        raw = (user_id or "default").strip()
+        if not raw:
+            raw = "default"
+        sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", raw).strip("_")
+        if not sanitized:
+            sanitized = "default"
+        if sanitized != raw:
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+            safe_user = f"{sanitized}_{digest}"
+        else:
+            safe_user = sanitized
+        path = (self.root_dir / safe_user).resolve()
+        if not path.is_relative_to(self.root_dir):
+            path = self.root_dir / "default"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -112,7 +127,7 @@ class MarkdownStorage:
             match = _FACT_LINE_REGEX.match(line)
             if not match:
                 continue
-            content = match.group("content").strip()
+            content = match.group("content").strip().replace(r"\n", "\n").replace("&lt;!--", "<!--")
             if not content:
                 continue
 
@@ -166,129 +181,136 @@ class MarkdownStorage:
                 meta_parts.append(f"count: {f.access_count}")
 
             meta_tag = f" <!-- {' | '.join(meta_parts)} -->" if meta_parts else ""
-            lines.append(f"- [{f.id}] {f.content}{meta_tag}")
+            escaped_content = f.content.replace("\r\n", r"\n").replace("\n", r"\n").replace("<!--", "&lt;!--")
+            lines.append(f"- [{f.id}] {escaped_content}{meta_tag}")
         lines.append("")
         return "\n".join(lines)
 
     def load_user_facts(self, user_id: str, category: str | None = None) -> list[MemoryFact]:
         """Load all facts for a user, optionally filtered by category."""
-        user_dir = self._user_dir(user_id)
-        categories = [category] if category else ["profile", "entity", "archive"]
-        all_facts: list[MemoryFact] = []
-        for cat in categories:
-            file_path = self._file_for_category(user_dir, cat)
-            if file_path.is_file():
-                try:
-                    text = file_path.read_text(encoding="utf-8")
-                    all_facts.extend(self.parse_markdown(text, default_category=cat))
-                except Exception:
-                    pass
-        return all_facts
+        with self._lock:
+            user_dir = self._user_dir(user_id)
+            categories = [category] if category else ["profile", "entity", "archive"]
+            all_facts: list[MemoryFact] = []
+            for cat in categories:
+                file_path = self._file_for_category(user_dir, cat)
+                if file_path.is_file():
+                    try:
+                        text = file_path.read_text(encoding="utf-8")
+                        all_facts.extend(self.parse_markdown(text, default_category=cat))
+                    except Exception:
+                        pass
+            return all_facts
 
     def save_facts_for_category(self, user_id: str, category: str, facts: list[MemoryFact]) -> None:
         """Write facts of a specific category to its corresponding Markdown file."""
-        user_dir = self._user_dir(user_id)
-        file_path = self._file_for_category(user_dir, category)
-        md = self.format_markdown(facts, category)
-        file_path.write_text(md, encoding="utf-8")
+        with self._lock:
+            user_dir = self._user_dir(user_id)
+            file_path = self._file_for_category(user_dir, category)
+            md = self.format_markdown(facts, category)
+            file_path.write_text(md, encoding="utf-8")
 
     def upsert_fact(self, user_id: str, fact: MemoryFact) -> tuple[MemoryFact, str | None]:
         """Insert or update a fact with contradiction / superseding resolution.
 
         Returns (saved_fact, superseded_fact_id).
         """
-        user_dir = self._user_dir(user_id)
-        category = fact.category or "profile"
-        file_path = self._file_for_category(user_dir, category)
-        existing: list[MemoryFact] = []
-        if file_path.is_file():
-            try:
-                existing = self.parse_markdown(file_path.read_text(encoding="utf-8"), category)
-            except Exception:
-                existing = []
+        with self._lock:
+            user_dir = self._user_dir(user_id)
+            category = fact.category or "profile"
+            file_path = self._file_for_category(user_dir, category)
+            existing: list[MemoryFact] = []
+            if file_path.is_file():
+                try:
+                    existing = self.parse_markdown(file_path.read_text(encoding="utf-8"), category)
+                except Exception:
+                    existing = []
 
-        now = datetime.datetime.now(datetime.UTC).isoformat()
-        if not fact.id:
-            fact.id = f"fact_{uuid.uuid4().hex[:8]}"
-        if not fact.created_at:
-            fact.created_at = now
-        if not fact.updated_at:
-            fact.updated_at = now
-        if not fact.last_accessed_at:
-            fact.last_accessed_at = fact.updated_at
+            now = datetime.datetime.now(datetime.UTC).isoformat()
+            if not fact.id:
+                fact.id = f"fact_{uuid.uuid4().hex[:8]}"
+            if not fact.created_at:
+                fact.created_at = now
+            if not fact.updated_at:
+                fact.updated_at = now
+            if not fact.last_accessed_at:
+                fact.last_accessed_at = fact.updated_at
 
-        new_topic = _extract_topic_key(fact.content)
-        superseded_id: str | None = None
-        replaced = False
-        new_list: list[MemoryFact] = []
+            new_topic = _extract_topic_key(fact.content)
+            superseded_id: str | None = None
+            replaced = False
+            new_list: list[MemoryFact] = []
 
-        for item in existing:
-            # 1. Exact ID or byte match
-            if item.id == fact.id or item.content.strip().lower() == fact.content.strip().lower():
-                fact.access_count = max(fact.access_count, item.access_count)
+            for item in existing:
+                # 1. Exact ID or byte match
+                if item.id == fact.id or item.content.strip().lower() == fact.content.strip().lower():
+                    fact.access_count = max(fact.access_count, item.access_count)
+                    new_list.append(fact)
+                    replaced = True
+                # 2. Contradiction / Superseding match on topic prefix in the same category
+                elif new_topic is not None and _extract_topic_key(item.content) == new_topic:
+                    superseded_id = item.id
+                    fact.access_count = max(fact.access_count, item.access_count + 1)
+                    new_list.append(fact)
+                    replaced = True
+                else:
+                    new_list.append(item)
+
+            if not replaced:
                 new_list.append(fact)
-                replaced = True
-            # 2. Contradiction / Superseding match on topic prefix in the same category
-            elif new_topic is not None and _extract_topic_key(item.content) == new_topic:
-                superseded_id = item.id
-                fact.access_count = max(fact.access_count, item.access_count + 1)
-                new_list.append(fact)
-                replaced = True
-            else:
-                new_list.append(item)
 
-        if not replaced:
-            new_list.append(fact)
+            # Automatic staleness pruning if category facts exceed limit
+            max_facts = self.config.max_facts_per_category
+            if len(new_list) > max_facts:
+                # Keep highest access count and most recently updated
+                new_list.sort(key=lambda x: (x.access_count, x.updated_at), reverse=True)
+                new_list = new_list[:max_facts]
 
-        # Automatic staleness pruning if category facts exceed limit
-        max_facts = self.config.max_facts_per_category
-        if len(new_list) > max_facts:
-            # Keep highest access count and most recently updated
-            new_list.sort(key=lambda x: (x.access_count, x.updated_at), reverse=True)
-            new_list = new_list[:max_facts]
-
-        self.save_facts_for_category(user_id, category, new_list)
-        return fact, superseded_id
+            self.save_facts_for_category(user_id, category, new_list)
+            return fact, superseded_id
 
     def touch_facts(self, user_id: str, fact_ids: list[str]) -> None:
         """Increment access count and touch timestamp for retrieved facts."""
         if not fact_ids:
             return
-        id_set = set(fact_ids)
-        now = datetime.datetime.now(datetime.UTC).isoformat()
-        for cat in ["profile", "entity", "archive"]:
-            facts = self.load_user_facts(user_id, category=cat)
-            changed = False
-            for f in facts:
-                if f.id in id_set:
-                    f.access_count += 1
-                    f.last_accessed_at = now
-                    changed = True
-            if changed:
-                self.save_facts_for_category(user_id, cat, facts)
+        with self._lock:
+            id_set = set(fact_ids)
+            now = datetime.datetime.now(datetime.UTC).isoformat()
+            for cat in ["profile", "entity", "archive"]:
+                facts = self.load_user_facts(user_id, category=cat)
+                changed = False
+                for f in facts:
+                    if f.id in id_set:
+                        f.access_count += 1
+                        f.last_accessed_at = now
+                        changed = True
+                if changed:
+                    self.save_facts_for_category(user_id, cat, facts)
 
     def delete_fact(self, user_id: str, fact_id: str) -> bool:
         """Delete a fact by ID across all categories for the user."""
-        user_dir = self._user_dir(user_id)
-        deleted = False
-        for cat in ["profile", "entity", "archive"]:
-            file_path = self._file_for_category(user_dir, cat)
-            if not file_path.is_file():
-                continue
-            existing = self.parse_markdown(file_path.read_text(encoding="utf-8"), cat)
-            remaining = [f for f in existing if f.id != fact_id]
-            if len(remaining) < len(existing):
-                self.save_facts_for_category(user_id, cat, remaining)
-                deleted = True
-        return deleted
+        with self._lock:
+            user_dir = self._user_dir(user_id)
+            deleted = False
+            for cat in ["profile", "entity", "archive"]:
+                file_path = self._file_for_category(user_dir, cat)
+                if not file_path.is_file():
+                    continue
+                existing = self.parse_markdown(file_path.read_text(encoding="utf-8"), cat)
+                remaining = [f for f in existing if f.id != fact_id]
+                if len(remaining) < len(existing):
+                    self.save_facts_for_category(user_id, cat, remaining)
+                    deleted = True
+            return deleted
 
     def clear_user(self, user_id: str) -> None:
         """Clear all memory files for a user."""
-        user_dir = self._user_dir(user_id)
-        for cat in ["profile", "entity", "archive"]:
-            f = self._file_for_category(user_dir, cat)
-            if f.is_file():
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+        with self._lock:
+            user_dir = self._user_dir(user_id)
+            for cat in ["profile", "entity", "archive"]:
+                f = self._file_for_category(user_dir, cat)
+                if f.is_file():
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass

@@ -55,6 +55,7 @@ class FtsIndexer:
         db_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = db_dir / config.fts_db_name
         self._lock = threading.Lock()
+        self._fts_available = False
         self._init_db()
 
     @contextmanager
@@ -68,12 +69,20 @@ class FtsIndexer:
 
     def _init_db(self) -> None:
         with self._lock, self._connection() as conn:
+            try:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA busy_timeout = 5000;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+            except Exception as e:
+                logger.debug("SQLite PRAGMA tuning notice: %s", e)
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS facts_meta (
                     fact_id TEXT PRIMARY KEY,
                     user_id TEXT,
                     category TEXT,
+                    content TEXT,
                     confidence REAL,
                     created_at TEXT,
                     updated_at TEXT,
@@ -85,6 +94,8 @@ class FtsIndexer:
             # Add columns if migrating from earlier schema
             cursor = conn.execute("PRAGMA table_info(facts_meta);")
             columns = {row["name"] for row in cursor.fetchall()}
+            if "content" not in columns:
+                conn.execute("ALTER TABLE facts_meta ADD COLUMN content TEXT;")
             if "access_count" not in columns:
                 conn.execute("ALTER TABLE facts_meta ADD COLUMN access_count INTEGER DEFAULT 0;")
             if "last_accessed_at" not in columns:
@@ -103,52 +114,70 @@ class FtsIndexer:
                     """
                 )
                 conn.commit()
+                self._fts_available = True
             except Exception as e:
-                logger.warning("FTS5 table initialization notice: %s", e)
+                logger.warning("FTS5 table initialization notice: %s; falling back to LIKE search", e)
+                self._fts_available = False
 
     def sync_user_facts(self, user_id: str, facts: list[MemoryFact]) -> None:
         """Replace all index entries for a user with the provided facts."""
         with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM facts_meta WHERE user_id = ?", (user_id,))
-            conn.execute("DELETE FROM aimem_fts WHERE user_id = ?", (user_id,))
+            if self._fts_available:
+                try:
+                    conn.execute("DELETE FROM aimem_fts WHERE user_id = ?", (user_id,))
+                except Exception:
+                    pass
 
             for f in facts:
                 conn.execute(
                     """
-                    INSERT INTO facts_meta (fact_id, user_id, category, confidence, created_at, updated_at, access_count, last_accessed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    INSERT INTO facts_meta (fact_id, user_id, category, content, confidence, created_at, updated_at, access_count, last_accessed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
-                    (f.id, user_id, f.category, f.confidence, f.created_at, f.updated_at, f.access_count, f.last_accessed_at),
+                    (f.id, user_id, f.category, f.content, f.confidence, f.created_at, f.updated_at, f.access_count, f.last_accessed_at),
                 )
-                conn.execute(
-                    """
-                    INSERT INTO aimem_fts (fact_id, user_id, category, content)
-                    VALUES (?, ?, ?, ?);
-                    """,
-                    (f.id, user_id, f.category, f.content),
-                )
+                if self._fts_available:
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO aimem_fts (fact_id, user_id, category, content)
+                            VALUES (?, ?, ?, ?);
+                            """,
+                            (f.id, user_id, f.category, f.content),
+                        )
+                    except Exception:
+                        pass
             conn.commit()
 
     def upsert_fact(self, user_id: str, fact: MemoryFact) -> None:
         """Update or insert a single fact in the index."""
         with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM facts_meta WHERE fact_id = ?", (fact.id,))
-            conn.execute("DELETE FROM aimem_fts WHERE fact_id = ?", (fact.id,))
+            if self._fts_available:
+                try:
+                    conn.execute("DELETE FROM aimem_fts WHERE fact_id = ?", (fact.id,))
+                except Exception:
+                    pass
 
             conn.execute(
                 """
-                INSERT INTO facts_meta (fact_id, user_id, category, confidence, created_at, updated_at, access_count, last_accessed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO facts_meta (fact_id, user_id, category, content, confidence, created_at, updated_at, access_count, last_accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                (fact.id, user_id, fact.category, fact.confidence, fact.created_at, fact.updated_at, fact.access_count, fact.last_accessed_at),
+                (fact.id, user_id, fact.category, fact.content, fact.confidence, fact.created_at, fact.updated_at, fact.access_count, fact.last_accessed_at),
             )
-            conn.execute(
-                """
-                INSERT INTO aimem_fts (fact_id, user_id, category, content)
-                VALUES (?, ?, ?, ?);
-                """,
-                (fact.id, user_id, fact.category, fact.content),
-            )
+            if self._fts_available:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO aimem_fts (fact_id, user_id, category, content)
+                        VALUES (?, ?, ?, ?);
+                        """,
+                        (fact.id, user_id, fact.category, fact.content),
+                    )
+                except Exception:
+                    pass
             conn.commit()
 
     def touch_facts(self, fact_ids: list[str]) -> None:
@@ -171,7 +200,11 @@ class FtsIndexer:
     def delete_fact(self, fact_id: str) -> None:
         with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM facts_meta WHERE fact_id = ?", (fact_id,))
-            conn.execute("DELETE FROM aimem_fts WHERE fact_id = ?", (fact_id,))
+            if self._fts_available:
+                try:
+                    conn.execute("DELETE FROM aimem_fts WHERE fact_id = ?", (fact_id,))
+                except Exception:
+                    pass
             conn.commit()
 
     def search(
@@ -186,6 +219,9 @@ class FtsIndexer:
         clean_query = _sanitize_fts_query(query)
         if not clean_query:
             return []
+
+        if not self._fts_available:
+            return self._fallback_like_search(query, top_k=top_k, user_id=user_id, category=category)
 
         raw_candidates: list[dict[str, Any]] = []
         sql = """
@@ -253,18 +289,17 @@ class FtsIndexer:
         category: str | None = None,
     ) -> list[dict[str, Any]]:
         sql = """
-            SELECT f.fact_id, f.user_id, f.category, f.content,
-                   m.confidence, m.created_at, m.updated_at, m.access_count, m.last_accessed_at
-            FROM aimem_fts f
-            LEFT JOIN facts_meta m ON f.fact_id = m.fact_id
-            WHERE f.content LIKE ?
+            SELECT fact_id, user_id, category, content,
+                   confidence, created_at, updated_at, access_count, last_accessed_at
+            FROM facts_meta
+            WHERE content LIKE ?
         """
         params: list[Any] = [f"%{query.strip()}%"]
         if user_id:
-            sql += " AND f.user_id = ?"
+            sql += " AND user_id = ?"
             params.append(user_id)
         if category:
-            sql += " AND f.category = ?"
+            sql += " AND category = ?"
             params.append(category)
         sql += " LIMIT ?"
         params.append(max(1, top_k))

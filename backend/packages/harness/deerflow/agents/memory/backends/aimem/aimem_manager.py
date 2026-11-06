@@ -7,6 +7,7 @@ and local SQLite FTS5 with BM25 + Recency Decay hybrid retrieval.
 from __future__ import annotations
 
 import datetime
+import html
 import logging
 import re
 from typing import Any, ClassVar, Literal
@@ -24,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 # Heuristic patterns for rule-based preference/fact detection
 _PREFERENCE_PATTERNS = [
-    re.compile(r"(?:remember that|note that|please note)\s+(?P<fact>.+)", re.IGNORECASE),
-    re.compile(r"i (?:prefer|like|love|dislike|hate)\s+(?P<fact>.+)", re.IGNORECASE),
-    re.compile(r"my (?:favorite|preferred|current)\s+(?P<fact>.+)", re.IGNORECASE),
+    re.compile(r"(?:please remember that|remember that|please note that|note that|please note|remember)\s+(?:that\s+)?(?P<fact>.+)", re.IGNORECASE),
+    re.compile(r"(?P<fact>(?:user|i)\s+(?:prefers?|likes?|loves?|dislikes?|hates?)\s+.+)", re.IGNORECASE),
+    re.compile(r"(?P<fact>(?:my|user's)\s+(?:favorite|preferred|current)\s+.+)", re.IGNORECASE),
     re.compile(r"(?:always|never)\s+(?P<fact>.+)", re.IGNORECASE),
     re.compile(r"(?:请记住|记住|记录一下|我的偏好是|我喜欢|我不喜欢|我的习惯是)\s*[:：]?\s*(?P<fact>.+)", re.IGNORECASE),
     re.compile(r"项目(?:使用|采用|配置|规范|依赖)\s*[:：]?\s*(?P<fact>.+)", re.IGNORECASE),
@@ -199,14 +200,17 @@ class AimemMemoryManager(MemoryManager):
         if not profiles and not entities and not archives:
             return ""
 
+        def _escape_context(val: str) -> str:
+            return html.escape(str(val), quote=False)
+
         # Format context injection block (outer <memory> tag is added by prompt builder)
         sections: list[str] = ["User Profile & Long-Term Context:"]
         for p in profiles:
-            sections.append(f"- (profile) {p.get('content', '')}")
+            sections.append(f"- (profile) {_escape_context(p.get('content', ''))}")
         for e in entities:
-            sections.append(f"- (entity) {e.get('content', '')}")
+            sections.append(f"- (entity) {_escape_context(e.get('content', ''))}")
         for a in archives:
-            sections.append(f"- (archive) {a.get('content', '')}")
+            sections.append(f"- (archive) {_escape_context(a.get('content', ''))}")
 
         return "\n".join(sections)
 
@@ -269,6 +273,24 @@ class AimemMemoryManager(MemoryManager):
         self._indexer.sync_user_facts(uid, [])
         return self.get_memory(user_id=uid, agent_name=agent_name)
 
+    def delete_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete memory for the user (alias for clear_memory)."""
+        return self.clear_memory(user_id=user_id, agent_name=agent_name)
+
+    def export_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Export memory in DeerMem-compatible schema."""
+        return self.get_memory(user_id=user_id, agent_name=agent_name)
+
     def import_memory(
         self,
         memory_data: dict[str, Any],
@@ -302,7 +324,7 @@ class AimemMemoryManager(MemoryManager):
     def create_fact(
         self,
         content: str,
-        category: str = "profile",
+        category: str = "context",
         confidence: float = 1.0,
         *,
         agent_name: str | None = None,
@@ -310,10 +332,11 @@ class AimemMemoryManager(MemoryManager):
     ) -> tuple[dict[str, Any], str | None]:
         """Create a fact directly (supports frontend UI Add Fact button)."""
         uid = user_id or "default"
+        cat = "profile" if category == "context" else (category or "profile")
         fact = MemoryFact(
             id="",
             content=content.strip(),
-            category=category,
+            category=cat,
             confidence=confidence,
         )
         saved, superseded_id = self._storage.upsert_fact(uid, fact)

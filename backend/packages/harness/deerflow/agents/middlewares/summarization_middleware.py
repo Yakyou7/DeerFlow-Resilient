@@ -1021,16 +1021,83 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 remaining.append(msg)
         return remaining, rescued + preserved_messages
 
+    @staticmethod
+    def _prune_tool_message_content(content: Any, max_chars: int, tool_name: str | None) -> tuple[Any, bool]:
+        """Prune verbose ToolMessage content if it exceeds max_chars.
+
+        Returns (pruned_content, was_pruned). Supports both plain text and
+        multimodal/structured list-of-blocks content.
+        """
+        name = tool_name or "unknown"
+        if isinstance(content, str):
+            if len(content) > max_chars:
+                prefix_len = min(120, max(20, max_chars // 2))
+                pruned_text = f"{content[:prefix_len]}\n... [Output truncated: {len(content)} chars total, tool={name}]"
+                return pruned_text, True
+            return content, False
+
+        if isinstance(content, list):
+            total_chars = sum(len(part) if isinstance(part, str) else len(part.get("text", "")) if isinstance(part, dict) and isinstance(part.get("text"), str) else 0 for part in content)
+            if total_chars > max_chars:
+                prefix_len = min(120, max(20, max_chars // 2))
+                new_content: list[Any] = []
+                rem = prefix_len
+                for part in content:
+                    if isinstance(part, str):
+                        if rem > 0:
+                            take = min(len(part), rem)
+                            new_content.append(part[:take])
+                            rem -= take
+                    elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                        block_text = part["text"]
+                        if rem > 0:
+                            take = min(len(block_text), rem)
+                            new_block = dict(part)
+                            new_block["text"] = block_text[:take]
+                            new_content.append(new_block)
+                            rem -= take
+                    else:
+                        new_content.append(part)
+                banner = f"\n... [Output truncated: {total_chars} chars total, tool={name}]"
+                new_content.append({"type": "text", "text": banner})
+                return new_content, True
+            return content, False
+
+        return content, False
+
     def _prune_preserved_tool_outputs(self, preserved_messages: list[AnyMessage]) -> list[AnyMessage]:
         """Prune older verbose ToolMessages in preserved_messages to prevent context bloat."""
         if not getattr(self, "_prune_tool_outputs", True):
             return preserved_messages
-        tool_indices = [i for i, m in enumerate(preserved_messages) if isinstance(m, ToolMessage)]
-        if not tool_indices:
+        tool_messages = [m for m in preserved_messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
             return preserved_messages
 
+        # Map tool_call_id to the turn_id (index of the calling AIMessage in preserved_messages)
+        call_to_turn: dict[str, int] = {}
+        for i, msg in enumerate(preserved_messages):
+            if isinstance(msg, AIMessage):
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                for tc in tool_calls:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    if tc_id:
+                        call_to_turn[tc_id] = i
+
+        # Group tool message indices by execution turn:
+        # Calls sharing an initiating AIMessage belong to the same turn.
+        turn_groups: dict[Any, list[int]] = {}
+        for i, msg in enumerate(preserved_messages):
+            if isinstance(msg, ToolMessage):
+                t_id = call_to_turn.get(msg.tool_call_id, f"standalone_{i}")
+                turn_groups.setdefault(t_id, []).append(i)
+
+        ordered_turns = list(turn_groups.values())
         keep_recent = getattr(self, "_keep_recent_tool_turns", 2)
-        protected_indices = set(tool_indices[-keep_recent:]) if keep_recent > 0 else set()
+        protected_indices: set[int] = set()
+        if keep_recent > 0 and ordered_turns:
+            for turn_indices in ordered_turns[-keep_recent:]:
+                protected_indices.update(turn_indices)
+
         max_chars = getattr(self, "_max_tool_output_chars", 300)
 
         result: list[AnyMessage] = []
@@ -1039,12 +1106,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 result.append(m)
                 continue
 
-            content = m.content
-            if isinstance(content, str) and len(content) > max_chars:
-                pruned_content = (
-                    f"{content[:120]}\n"
-                    f"... [Output truncated: {len(content)} chars total, tool={m.name or 'unknown'}]"
-                )
+            pruned_content, was_pruned = self._prune_tool_message_content(m.content, max_chars, m.name)
+            if was_pruned:
                 pruned_msg = ToolMessage(
                     content=pruned_content,
                     name=m.name,
@@ -1053,6 +1116,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                     artifact=getattr(m, "artifact", None),
                     status=getattr(m, "status", "success"),
                     additional_kwargs=dict(m.additional_kwargs) if getattr(m, "additional_kwargs", None) else {},
+                    response_metadata=dict(getattr(m, "response_metadata", {})) if getattr(m, "response_metadata", None) else {},
                 )
                 result.append(pruned_msg)
             else:
@@ -1074,10 +1138,10 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return False
 
         reported_tokens = last_ai_message.usage_metadata.get("total_tokens")
-        if reported_tokens is None or reported_tokens < 0:
+        if reported_tokens is None or (isinstance(reported_tokens, (int, float)) and reported_tokens < 0):
             reported_tokens = last_ai_message.usage_metadata.get("input_tokens", -1)
 
-        if reported_tokens < threshold:
+        if not isinstance(reported_tokens, (int, float)) or reported_tokens < threshold:
             return False
 
         message_provider = (getattr(last_ai_message, "response_metadata", None) or {}).get("model_provider")
