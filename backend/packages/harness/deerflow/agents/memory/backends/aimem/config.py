@@ -55,6 +55,15 @@ class AimemConfig:
     #: Context budget ratio allocated to historical decisions/epics (default: 20%).
     archive_budget_ratio: float = 0.2
 
+    #: Whether to enable sleep-time compute (Letta-style offline background crystallization).
+    sleep_time_compute_enabled: bool = True
+
+    #: Idle debounce window in seconds before background crystallization triggers.
+    sleep_idle_debounce_seconds: float = 1.0
+
+    #: Maximum pending raw conversation traces to buffer before forced crystallization.
+    max_pending_traces: int = 1000
+
     #: Optional host-injected hidden message filter hook.
     should_keep_hidden_message: Callable[[dict[str, Any]], bool] | None = None
 
@@ -83,6 +92,9 @@ class AimemConfig:
             profile_budget_ratio=float(cfg.get("profile_budget_ratio", 0.4)),
             entity_budget_ratio=float(cfg.get("entity_budget_ratio", 0.4)),
             archive_budget_ratio=float(cfg.get("archive_budget_ratio", 0.2)),
+            sleep_time_compute_enabled=bool(cfg.get("sleep_time_compute_enabled", True)),
+            sleep_idle_debounce_seconds=float(cfg.get("sleep_idle_debounce_seconds", 1.0)),
+            max_pending_traces=int(cfg.get("max_pending_traces", 1000)),
             should_keep_hidden_message=host_hooks.get("should_keep_hidden_message"),
             host_llm_factory=host_hooks.get("host_llm_factory"),
         )

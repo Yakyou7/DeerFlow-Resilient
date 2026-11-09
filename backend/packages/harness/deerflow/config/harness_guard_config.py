@@ -44,3 +44,11 @@ class HarnessGuardConfig(BaseModel):
         ge=10,
         description="Maximum number of tracked thread/run scopes retained in the bounded LRU history cache",
     )
+    dpo_data_collection_enabled: bool = Field(
+        default=True,
+        description="Whether to capture repetition/syntax failures and subsequent recoveries as DPO preference pairs (arXiv:2610.19376)",
+    )
+    dpo_dataset_path: str | None = Field(
+        default=None,
+        description="Optional local filesystem path for append-only JSONL persistence of DPO training pairs",
+    )

@@ -6,10 +6,13 @@ and local SQLite FTS5 with BM25 + Recency Decay hybrid retrieval.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import datetime
 import html
 import logging
 import re
+import threading
+import time
 from typing import Any, ClassVar, Literal
 
 from pydantic import PrivateAttr
@@ -36,6 +39,18 @@ _PREFERENCE_PATTERNS = [
 _TRIVIAL_WORDS = {"ok", "okay", "thanks", "thank you", "thx", "got it", "sure", "好的", "收到", "知道了", "谢谢", "嗯", "对", "行", "明白"}
 
 
+@dataclass
+class _RawTrace:
+    """Buffered raw conversation trace awaiting sleep-time crystallization."""
+
+    user_id: str
+    thread_id: str
+    messages: list[Any]
+    agent_name: str | None = None
+    trace_id: str | None = None
+    timestamp: float = 0.0
+
+
 class AimemMemoryManager(MemoryManager):
     """Hierarchical memory backend with Markdown persistence and SQLite FTS5 index."""
 
@@ -45,11 +60,17 @@ class AimemMemoryManager(MemoryManager):
     _config: AimemConfig = PrivateAttr(default=None)
     _storage: MarkdownStorage = PrivateAttr(default=None)
     _indexer: FtsIndexer = PrivateAttr(default=None)
+    _pending_traces: list[_RawTrace] = PrivateAttr(default_factory=list)
+    _sleep_timer: threading.Timer | None = PrivateAttr(default=None)
+    _sleep_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
     def model_post_init(self, __context: Any) -> None:
         self._config = AimemConfig.from_backend_config(self.backend_config)
         self._storage = MarkdownStorage(self._config)
         self._indexer = FtsIndexer(self._config)
+        self._pending_traces = []
+        self._sleep_timer = None
+        self._sleep_lock = threading.Lock()
 
     @classmethod
     def from_config(
@@ -63,21 +84,24 @@ class AimemMemoryManager(MemoryManager):
         merged = {**cfg, **host_hooks}
         return cls(backend_config=merged, mode=mode)
 
+    @property
+    def pending_traces_count(self) -> int:
+        """Return the number of buffered raw conversation traces pending crystallization."""
+        with self._sleep_lock:
+            return len(self._pending_traces)
+
     # ── Write Operations (Tier 1) ──────────────────────────────────────────
 
-    def add(
-        self,
-        thread_id: str,
-        messages: list[Any],
-        *,
-        agent_name: str | None = None,
-        user_id: str | None = None,
-        trace_id: str | None = None,
-    ) -> None:
-        """Extract and persist facts from conversation messages with superseding support."""
-        uid = user_id or "default"
+    def _extract_and_persist(self, uid: str, messages: list[Any]) -> tuple[int, int]:
+        """Synchronously extract preference/entity facts from messages and persist to Markdown & FTS.
+
+        Returns (crystallized_count, superseded_count).
+        """
         if not messages:
-            return
+            return 0, 0
+
+        crystallized_count = 0
+        superseded_count = 0
 
         for msg in messages:
             content = getattr(msg, "content", None)
@@ -112,10 +136,111 @@ class AimemMemoryManager(MemoryManager):
                 saved_fact, superseded_id = self._storage.upsert_fact(uid, fact)
                 if superseded_id:
                     self._indexer.delete_fact(superseded_id)
+                    superseded_count += 1
                     logger.info("Aimem superseded outdated fact: [%s]", superseded_id)
 
                 self._indexer.upsert_fact(uid, saved_fact)
+                crystallized_count += 1
                 logger.info("Aimem stored fact: [%s] (%s) %s", saved_fact.id, saved_fact.category, saved_fact.content)
+
+        return crystallized_count, superseded_count
+
+    def add(
+        self,
+        thread_id: str,
+        messages: list[Any],
+        *,
+        agent_name: str | None = None,
+        user_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """Extract and persist facts from conversation messages with sleep-time compute support."""
+        uid = user_id or "default"
+        if not messages:
+            return
+
+        if not self._config.sleep_time_compute_enabled:
+            self._extract_and_persist(uid, messages)
+            return
+
+        trace = _RawTrace(
+            user_id=uid,
+            thread_id=thread_id,
+            messages=list(messages),
+            agent_name=agent_name,
+            trace_id=trace_id,
+            timestamp=time.time(),
+        )
+
+        with self._sleep_lock:
+            self._pending_traces.append(trace)
+            while len(self._pending_traces) > self._config.max_pending_traces:
+                self._pending_traces.pop(0)
+
+            if self._sleep_timer is not None:
+                self._sleep_timer.cancel()
+                self._sleep_timer = None
+
+            debounce = max(0.01, self._config.sleep_idle_debounce_seconds)
+            self._sleep_timer = threading.Timer(debounce, self._on_sleep_timer_trigger)
+            self._sleep_timer.daemon = True
+            self._sleep_timer.start()
+
+    def _on_sleep_timer_trigger(self) -> None:
+        """Triggered when agent conversation experiences idle period."""
+        try:
+            self.sleep_time_compute()
+        except Exception:
+            logger.exception("Error during Aimem sleep_time_compute background crystallization")
+
+    def sleep_time_compute(self, user_id: str | None = None) -> dict[str, Any]:
+        """Drain buffered conversation traces and crystallize into long-term memory.
+
+        Inspired by Letta / Sleep-Time Compute: separates raw collection from
+        cognitive extraction and deduplication/superseding.
+        """
+        with self._sleep_lock:
+            if user_id is not None:
+                traces = [t for t in self._pending_traces if t.user_id == user_id]
+                self._pending_traces = [t for t in self._pending_traces if t.user_id != user_id]
+                if not self._pending_traces and self._sleep_timer is not None:
+                    self._sleep_timer.cancel()
+                    self._sleep_timer = None
+            else:
+                traces = list(self._pending_traces)
+                self._pending_traces.clear()
+                if self._sleep_timer is not None:
+                    self._sleep_timer.cancel()
+                    self._sleep_timer = None
+
+        if not traces:
+            return {"crystallized_facts": 0, "superseded_facts": 0, "processed_traces": 0}
+
+        total_crystallized = 0
+        total_superseded = 0
+        for trace in traces:
+            c, s = self._extract_and_persist(trace.user_id, trace.messages)
+            total_crystallized += c
+            total_superseded += s
+
+        logger.info(
+            "Aimem sleep_time_compute completed: processed %d traces, crystallized %d facts, superseded %d facts",
+            len(traces),
+            total_crystallized,
+            total_superseded,
+        )
+        return {
+            "crystallized_facts": total_crystallized,
+            "superseded_facts": total_superseded,
+            "processed_traces": len(traces),
+        }
+
+    def _ensure_crystallized(self, user_id: str) -> None:
+        """Guarantee Read-Your-Own-Writes consistency by draining pending traces for user_id."""
+        with self._sleep_lock:
+            has_pending = any(t.user_id == user_id for t in self._pending_traces)
+        if has_pending:
+            self.sleep_time_compute(user_id=user_id)
 
     def add_nowait(
         self,
@@ -139,6 +264,7 @@ class AimemMemoryManager(MemoryManager):
     ) -> str:
         """Generate tiered context memory injection with budget allocation and recency decay."""
         uid = user_id or "default"
+        self._ensure_crystallized(uid)
         max_facts = self._config.max_context_facts
         if max_facts <= 0:
             return ""
@@ -227,6 +353,7 @@ class AimemMemoryManager(MemoryManager):
     ) -> list[dict[str, Any]]:
         """Search memory facts using hybrid ranking (BM25 + recency decay + access frequency)."""
         uid = user_id or "default"
+        self._ensure_crystallized(uid)
         if not self._config.enable_fts:
             facts = self._storage.load_user_facts(uid, category=category)
             q = query.lower()
@@ -251,6 +378,7 @@ class AimemMemoryManager(MemoryManager):
     ) -> dict[str, Any]:
         """Return memory in DeerMem-compatible schema."""
         uid = user_id or "default"
+        self._ensure_crystallized(uid)
         facts = self._storage.load_user_facts(uid)
         now = datetime.datetime.now(datetime.UTC).isoformat()
         return {
@@ -269,6 +397,11 @@ class AimemMemoryManager(MemoryManager):
     ) -> dict[str, Any]:
         """Clear memory for the user."""
         uid = user_id or "default"
+        with self._sleep_lock:
+            self._pending_traces = [t for t in self._pending_traces if t.user_id != uid]
+            if not self._pending_traces and self._sleep_timer is not None:
+                self._sleep_timer.cancel()
+                self._sleep_timer = None
         self._storage.clear_user(uid)
         self._indexer.sync_user_facts(uid, [])
         return self.get_memory(user_id=uid, agent_name=agent_name)
@@ -398,5 +531,18 @@ class AimemMemoryManager(MemoryManager):
         logger.info("Aimem reloaded and re-indexed %d facts for user %s", len(facts), uid)
         return self.get_memory(user_id=uid, agent_name=agent_name)
 
-    def shutdown_flush(self, timeout: float) -> bool:
+    def shutdown_flush(self, timeout: float = 5.0) -> bool:
+        """Best-effort bounded drain of pending updates on graceful shutdown."""
+        with self._sleep_lock:
+            if self._sleep_timer is not None:
+                self._sleep_timer.cancel()
+                self._sleep_timer = None
+        self.sleep_time_compute()
         return True
+
+    def close(self) -> None:
+        """Release backend resources and flush pending sleep compute traces."""
+        self.shutdown_flush(5.0)
+        if self._indexer is not None:
+            self._indexer.close()
+        super().close()

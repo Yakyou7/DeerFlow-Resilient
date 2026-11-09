@@ -18,6 +18,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 HandoffStatus = Literal["completed", "blocked", "partial", "failed"]
+MergeStatus = Literal["clean", "conflict", "skipped", "merged"]
 
 
 class TypedHandoff(BaseModel):
@@ -46,6 +47,22 @@ class TypedHandoff(BaseModel):
     summary: str = Field(
         default="",
         description="Concise summary of work performed (<= 250 characters)",
+    )
+    worktree_branch: str | None = Field(
+        default=None,
+        description="Git worktree branch where subagent changes were committed",
+    )
+    worktree_path: str | None = Field(
+        default=None,
+        description="Filesystem path of the isolated worker worktree",
+    )
+    merge_status: MergeStatus | None = Field(
+        default=None,
+        description="Merge resolution status against the primary branch",
+    )
+    peer_negotiation: dict[str, Any] | None = Field(
+        default=None,
+        description="P2P resource collision negotiation outcome between concurrent workers",
     )
 
 
@@ -86,6 +103,10 @@ def parse_typed_handoff(
             "summary": [],
         }
         current_section = "summary"
+        worktree_branch: str | None = None
+        worktree_path: str | None = None
+        merge_status: MergeStatus | None = None
+
         for line in body.splitlines():
             line_str = line.strip()
             if not line_str:
@@ -95,6 +116,17 @@ def parse_typed_handoff(
                 val = line_str.split(":", 1)[1].strip().lower()
                 if val in ("completed", "blocked", "partial", "failed"):
                     handoff_status = val  # type: ignore[assignment]
+                continue
+            elif any(lower_line.startswith(p) for p in ("worktree_branch:", "worktree branch:", "branch:")):
+                worktree_branch = line_str.split(":", 1)[1].strip()
+                continue
+            elif any(lower_line.startswith(p) for p in ("worktree_path:", "worktree path:", "worktree:")):
+                worktree_path = line_str.split(":", 1)[1].strip()
+                continue
+            elif any(lower_line.startswith(p) for p in ("merge_status:", "merge status:")):
+                ms_val = line_str.split(":", 1)[1].strip().lower()
+                if ms_val in ("clean", "conflict", "skipped", "merged"):
+                    merge_status = ms_val  # type: ignore[assignment]
                 continue
             elif any(lower_line.startswith(p) for p in ("attempted:", "attempted_paths:", "attempted paths:")):
                 current_section = "attempted"
@@ -140,6 +172,9 @@ def parse_typed_handoff(
             deliverables=_clean_list_items(sections["deliverables"]),
             remaining_goals=_clean_list_items(sections["next"]),
             summary=summary_text,
+            worktree_branch=worktree_branch,
+            worktree_path=worktree_path,
+            merge_status=merge_status,
         )
 
     # 2. Heuristic extraction fallback when explicit tag is absent
@@ -210,6 +245,14 @@ def render_handoff_section(handoff: TypedHandoff) -> str:
     else:
         lines.append("- **Deliverables**: None")
 
+    if handoff.worktree_branch:
+        status_suffix = f" (merge: {handoff.merge_status})" if handoff.merge_status else ""
+        lines.append(f"- **Worktree Branch**: `{handoff.worktree_branch}`{status_suffix}")
+
+    if handoff.peer_negotiation:
+        action = handoff.peer_negotiation.get("suggested_action", "none")
+        lines.append(f"- **Peer Negotiation**: {action}")
+
     if handoff.fatal_blocks:
         lines.append("- **Fatal Blocks** (Do not repeat):")
         for fb in handoff.fatal_blocks:
@@ -229,3 +272,34 @@ def render_handoff_section(handoff: TypedHandoff) -> str:
 
     lines.append("</subagent_handoff>")
     return "\n".join(lines)
+
+
+def negotiate_peer_handoffs(
+    handoff_a: TypedHandoff,
+    handoff_b: TypedHandoff,
+    worktree_mgr: Any = None,
+) -> dict[str, Any]:
+    """Negotiate resource and deliverable collisions between two peer subagents.
+
+    Inspired by Microsoft Agensh P2P negotiation protocol: detects colliding
+    deliverables or overlapping modified files across concurrent workers without
+    escalating to the lead agent.
+    """
+    files_a = set(handoff_a.deliverables)
+    files_b = set(handoff_b.deliverables)
+    overlap = sorted(files_a.intersection(files_b))
+
+    has_collision = len(overlap) > 0
+    suggested_action = "none"
+    if has_collision:
+        suggested_action = "serialize_or_rebase"
+
+    negotiation = {
+        "has_collision": has_collision,
+        "colliding_files": overlap,
+        "suggested_action": suggested_action,
+        "peer_branches": [handoff_a.worktree_branch, handoff_b.worktree_branch],
+    }
+    handoff_a.peer_negotiation = negotiation
+    handoff_b.peer_negotiation = negotiation
+    return negotiation

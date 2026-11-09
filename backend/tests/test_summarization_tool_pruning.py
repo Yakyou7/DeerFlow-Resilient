@@ -224,3 +224,39 @@ def test_reported_tokens_malformed_type_guard():
     ai_msg_none = AIMessage(content="calling tool")
     object.__setattr__(ai_msg_none, "usage_metadata", {"input_tokens": None, "total_tokens": None})
     assert middleware._should_summarize_based_on_reported_tokens([ai_msg_none], 32000.0) is False
+
+
+def test_handoff_and_error_exemption_from_pruning():
+    middleware = _mock_middleware(
+        prune_tool_outputs=True,
+        max_tool_output_chars=50,
+        keep_recent_tool_turns=0,
+    )
+    # 1. Subagent handoff message (exempt from pruning)
+    t_handoff = ToolMessage(
+        content="Long report\n<handoff>\nstatus: completed\nsummary: done\n</handoff>",
+        tool_call_id="c_sub",
+        name="task",
+        additional_kwargs={"handoff": {"status": "completed"}},
+    )
+    # 2. Error message (exempt from pruning)
+    t_error = ToolMessage(
+        content="Detailed stack trace: " + "E" * 200,
+        tool_call_id="c_err",
+        name="bash",
+        status="error",
+    )
+    # 3. Regular tool message (should be pruned)
+    t_regular = ToolMessage(
+        content="Normal output: " + "N" * 200,
+        tool_call_id="c_reg",
+        name="read_file",
+    )
+
+    pruned = middleware._prune_preserved_tool_outputs([t_handoff, t_error, t_regular])
+    assert len(pruned) == 3
+    # Handoff and error preserved in full
+    assert "<handoff>" in pruned[0].content
+    assert pruned[1].content.startswith("Detailed stack trace: EEEEE")
+    # Regular tool output pruned
+    assert "[Output truncated:" in pruned[2].content

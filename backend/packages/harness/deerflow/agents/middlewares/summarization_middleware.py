@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
+import re
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -45,6 +46,54 @@ _SUMMARY_CHUNK_RETRY_MAX_ENTRIES = 128
 _SUMMARY_CHUNK_RETRY_CACHE: OrderedDict[str, tuple[float, int]] = OrderedDict()
 _SUMMARY_CHUNK_RETRY_LOCK = threading.Lock()
 _SHORTENED_SUMMARY_MARKER = "\n[summary shortened]\n"
+
+
+def extract_pinned_constraints(text: str) -> list[str]:
+    """Extract negative rules and safety boundaries inside <pinned_constraints> tags (arXiv:2610.31778)."""
+    if not text:
+        return []
+    matches = re.findall(r"<pinned_constraints>(.*?)(?:</pinned_constraints>|\Z)", text, re.DOTALL | re.IGNORECASE)
+    constraints: list[str] = []
+    for m in matches:
+        for line in m.strip().splitlines():
+            line_str = line.strip().lstrip("-*• ").strip()
+            if line_str and line_str not in constraints:
+                constraints.append(line_str)
+    return constraints
+
+
+def merge_pinned_constraints(existing_constraints: list[str], new_text: str) -> str:
+    """Ensure pinned constraints are merged and preserved at the top of summary text."""
+    new_extracted = extract_pinned_constraints(new_text)
+    all_constraints: list[str] = list(existing_constraints)
+    for c in new_extracted:
+        if c not in all_constraints:
+            all_constraints.append(c)
+
+    cleaned_text = re.sub(r"<pinned_constraints>.*?(?:</pinned_constraints>|\Z)", "", new_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not all_constraints:
+        return cleaned_text
+
+    pinned_block = "<pinned_constraints>\n" + "\n".join(f"- {c}" for c in all_constraints) + "\n</pinned_constraints>"
+    if cleaned_text:
+        return f"{pinned_block}\n\n{cleaned_text}"
+    return pinned_block
+
+
+def _is_exempt_from_tool_pruning(msg: ToolMessage) -> bool:
+    """Exempt error messages and subagent typed handoffs (<handoff>) from tool output pruning (OMA)."""
+    if getattr(msg, "status", None) == "error":
+        return True
+    additional_kwargs = getattr(msg, "additional_kwargs", None) or {}
+    if "handoff" in additional_kwargs or "typed_handoff" in additional_kwargs:
+        return True
+    tool_name = (getattr(msg, "name", None) or "").lower()
+    if tool_name in ("task", "subagent", "delegate", "typed_handoff", "subagent_task"):
+        return True
+    content = str(getattr(msg, "content", "") or "")
+    if "<handoff>" in content or "<subagent_handoff" in content:
+        return True
+    return False
 
 
 class _ReusedSummary(str):
@@ -572,6 +621,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
         # The complete candidate (including its marker) is measured. An
         # impossibly small budget fails instead of producing an empty carry.
+        pinned = extract_pinned_constraints(text)
         low, high, bounded = 2, len(text) - 1, None
         while low <= high:
             middle = (low + high) // 2
@@ -584,6 +634,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             logger.warning("Summary carry cannot fit: carry_tokens=%d carry_budget=%d input_budget=%d", tokens, carry_budget, budget)
         else:
             logger.debug("Summary carry shortened: carry_tokens=%d bounded_tokens=%d carry_budget=%d input_budget=%d", tokens, self._summary_text_tokens(bounded), carry_budget, budget)
+            if pinned:
+                bounded = merge_pinned_constraints(pinned, bounded)
         return bounded
 
     def _summary_retry_key(self, runtime: Runtime | None, messages: list[AnyMessage], previous_summary: str | None) -> str | None:
@@ -1102,12 +1154,19 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
         result: list[AnyMessage] = []
         for i, m in enumerate(preserved_messages):
-            if i in protected_indices or not isinstance(m, ToolMessage):
+            if i in protected_indices or not isinstance(m, ToolMessage) or _is_exempt_from_tool_pruning(m):
                 result.append(m)
                 continue
 
             pruned_content, was_pruned = self._prune_tool_message_content(m.content, max_chars, m.name)
             if was_pruned:
+                chars_saved = len(str(m.content)) - len(str(pruned_content))
+                logger.info(
+                    "context/replace: pruned tool output for tool_call_id=%s (name=%s, saved %d chars)",
+                    m.tool_call_id,
+                    m.name,
+                    chars_saved,
+                )
                 pruned_msg = ToolMessage(
                     content=pruned_content,
                     name=m.name,

@@ -1,6 +1,7 @@
 """Unit tests for HarnessGuardMiddleware (RFC-003, Route C Phase 1)."""
 
 from unittest.mock import MagicMock, patch
+import json
 
 import pytest
 from langchain_core.messages import ToolMessage
@@ -419,3 +420,100 @@ class TestHarnessGuardMiddleware:
         )
         assert "[HARNESS GUARD]" in res.content
         assert "pip install torch_geometric" in res.content
+
+    def test_deloop_dpo_collection_on_syntax_recovery(self):
+        middleware = HarnessGuardMiddleware(HarnessGuardConfig(dpo_data_collection_enabled=True))
+
+        # 1. Negative action: invalid Python syntax write
+        req_bad = _make_request("write_file", {"path": "app.py", "content": "def bad(:"})
+        res_bad = middleware.wrap_tool_call(req_bad, lambda r: ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name="write_file"))
+        assert res_bad.status == "error"
+        assert len(middleware.collected_dpo_pairs) == 0
+
+        # 2. Positive action: corrected syntax write recovers
+        req_good = _make_request("write_file", {"path": "app.py", "content": "def good(): pass"})
+        res_good = middleware.wrap_tool_call(req_good, lambda r: ToolMessage(content="Successfully written", tool_call_id=r.tool_call["id"], name="write_file"))
+        assert res_good.status != "error"
+
+        # 3. DPO preference pair is formed
+        pairs = middleware.collected_dpo_pairs
+        assert len(pairs) == 1
+        pair = pairs[0]
+        assert pair.rejected_tool_name == "write_file"
+        assert "def bad(:" in pair.rejected_args["content"]
+        assert pair.chosen_tool_name == "write_file"
+        assert "def good(): pass" in pair.chosen_args["content"]
+
+    def test_deloop_dpo_collection_on_repetition_recovery(self):
+        middleware = HarnessGuardMiddleware(HarnessGuardConfig(dpo_data_collection_enabled=True, max_repeated_error_signatures=2))
+
+        # Turn 1: failure with ModuleNotFoundError
+        req1 = _make_request("bash", {"command": "python script.py"})
+        middleware.wrap_tool_call(req1, lambda r: ToolMessage(content="ModuleNotFoundError: No module named 'httpx'", tool_call_id=r.tool_call["id"], name="bash", status="error"))
+
+        # Turn 2: repeat failure triggers CRITICAL REPETITION warning
+        req2 = _make_request("bash", {"command": "python script.py"})
+        res2 = middleware.wrap_tool_call(req2, lambda r: ToolMessage(content="ModuleNotFoundError: No module named 'httpx'", tool_call_id=r.tool_call["id"], name="bash", status="error"))
+        assert "[HARNESS GUARD: CRITICAL REPETITION]" in res2.content
+
+        # Turn 3: recovery action fixes the dependency
+        req3 = _make_request("bash", {"command": "pip install httpx"})
+        middleware.wrap_tool_call(req3, lambda r: ToolMessage(content="Successfully installed httpx", tool_call_id=r.tool_call["id"], name="bash"))
+
+        pairs = middleware.collected_dpo_pairs
+        assert len(pairs) == 1
+        assert pairs[0].rejected_tool_name == "bash"
+        assert pairs[0].rejected_args["command"] == "python script.py"
+        assert pairs[0].chosen_tool_name == "bash"
+        assert pairs[0].chosen_args["command"] == "pip install httpx"
+
+    def test_deloop_dpo_collection_on_oscillation_recovery(self):
+        middleware = HarnessGuardMiddleware(HarnessGuardConfig(dpo_data_collection_enabled=True, detect_alternating_loops=True))
+
+        # A -> B -> A -> B loop
+        r_t1a = _make_request("tool_a", {"cmd": "run_a"})
+        middleware.wrap_tool_call(r_t1a, lambda r: ToolMessage(content="Failed A", tool_call_id=r.tool_call["id"], name="tool_a", status="error"))
+        r_t1b = _make_request("tool_b", {"cmd": "run_b"})
+        middleware.wrap_tool_call(r_t1b, lambda r: ToolMessage(content="Failed B", tool_call_id=r.tool_call["id"], name="tool_b", status="error"))
+        r_t2a = _make_request("tool_a", {"cmd": "run_a"})
+        middleware.wrap_tool_call(r_t2a, lambda r: ToolMessage(content="Failed A", tool_call_id=r.tool_call["id"], name="tool_a", status="error"))
+        r_t2b = _make_request("tool_b", {"cmd": "run_b"})
+        res_osc = middleware.wrap_tool_call(r_t2b, lambda r: ToolMessage(content="Failed B", tool_call_id=r.tool_call["id"], name="tool_b", status="error"))
+        assert "[HARNESS GUARD: OSCILLATION DETECTED]" in res_osc.content
+
+        # Recovery action breaks the loop with tool_c
+        r_recovery = _make_request("tool_c", {"cmd": "clean_approach"})
+        middleware.wrap_tool_call(r_recovery, lambda r: ToolMessage(content="Success with C", tool_call_id=r.tool_call["id"], name="tool_c"))
+
+        pairs = middleware.collected_dpo_pairs
+        assert len(pairs) == 1
+        assert pairs[0].chosen_tool_name == "tool_c"
+
+    def test_deloop_dpo_disabled_flag(self):
+        middleware = HarnessGuardMiddleware(HarnessGuardConfig(dpo_data_collection_enabled=False))
+        req_bad = _make_request("write_file", {"path": "bad.py", "content": "def bad(:"})
+        middleware.wrap_tool_call(req_bad, lambda r: ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name="write_file"))
+        req_good = _make_request("write_file", {"path": "bad.py", "content": "def good(): pass"})
+        middleware.wrap_tool_call(req_good, lambda r: ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name="write_file"))
+
+        assert len(middleware.collected_dpo_pairs) == 0
+
+    def test_deloop_dpo_disk_persistence(self, tmp_path):
+        jsonl_path = tmp_path / "dpo_pairs.jsonl"
+        middleware = HarnessGuardMiddleware(
+            HarnessGuardConfig(
+                dpo_data_collection_enabled=True,
+                dpo_dataset_path=str(jsonl_path),
+            )
+        )
+        req_bad = _make_request("write_file", {"path": "syntax.py", "content": "def broken(:"})
+        middleware.wrap_tool_call(req_bad, lambda r: ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name="write_file"))
+        req_good = _make_request("write_file", {"path": "syntax.py", "content": "def fixed(): pass"})
+        middleware.wrap_tool_call(req_good, lambda r: ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name="write_file"))
+
+        assert jsonl_path.exists()
+        lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["rejected"]["tool"] == "write_file"
+        assert data["chosen"]["tool"] == "write_file"

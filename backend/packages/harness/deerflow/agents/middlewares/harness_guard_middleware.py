@@ -14,8 +14,10 @@ import ast
 import asyncio
 import json
 import logging
+from pathlib import Path
 import re
 import threading
+import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
@@ -52,6 +54,48 @@ class ErrorSignature:
     entity: str
     signature: str
     targeted_hint: str
+
+
+@dataclass(frozen=True)
+class _PendingFailure:
+    """Pending negative candidate awaiting recovery action to form a DPO pair (arXiv:2610.19376)."""
+
+    tool_name: str
+    args: dict[str, Any]
+    error_signature: str
+    failure_type: str
+    prompt_context: str | None = None
+    timestamp: float = 0.0
+
+
+@dataclass(frozen=True)
+class DPOPreferencePair:
+    """Self-supervised preference pair: rejected (failed/repetitive action) vs chosen (recovery action)."""
+
+    prompt_context: str | None
+    rejected_tool_name: str
+    rejected_args: dict[str, Any]
+    rejected_error: str
+    chosen_tool_name: str
+    chosen_args: dict[str, Any]
+    chosen_result_preview: str
+    timestamp: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "prompt_context": self.prompt_context,
+            "rejected": {
+                "tool": self.rejected_tool_name,
+                "args": self.rejected_args,
+                "error": self.rejected_error,
+            },
+            "chosen": {
+                "tool": self.chosen_tool_name,
+                "args": self.chosen_args,
+                "result_preview": self.chosen_result_preview,
+            },
+            "timestamp": self.timestamp,
+        }
 
 
 def classify_tool_error(content: str) -> ErrorSignature | None:
@@ -214,6 +258,79 @@ class HarnessGuardMiddleware(AgentMiddleware):
         self._max_fallback_run_ids = max(1, self.config.max_tracked_scopes * 2)
         # Bounded LRU history: _ScopeKey -> deque of _ToolRecord
         self._history: BoundedDict[_ScopeKey, deque[_ToolRecord]] = BoundedDict(maxsize=self.config.max_tracked_scopes)
+        # DeLoop Flywheel: bounded tracking of pending failures awaiting recovery
+        self._pending_failures: BoundedDict[_ScopeKey, _PendingFailure] = BoundedDict(maxsize=self.config.max_tracked_scopes)
+        self._collected_dpo_pairs: deque[DPOPreferencePair] = deque(maxlen=1000)
+
+    @property
+    def collected_dpo_pairs(self) -> list[DPOPreferencePair]:
+        """Return collected DPO preference pairs."""
+        with self._lock:
+            return list(self._collected_dpo_pairs)
+
+    def _record_pending_failure(
+        self,
+        scope_key: _ScopeKey,
+        tool_name: str,
+        args: dict[str, Any],
+        error_sig: str,
+        failure_type: str,
+    ) -> None:
+        """Register a negative action candidate when HarnessGuard flags a failure."""
+        if not self.config.dpo_data_collection_enabled:
+            return
+        failure = _PendingFailure(
+            tool_name=tool_name,
+            args=dict(args),
+            error_signature=error_sig,
+            failure_type=failure_type,
+            timestamp=time.time(),
+        )
+        with self._lock:
+            self._pending_failures[scope_key] = failure
+
+    def _resolve_and_collect_dpo(
+        self,
+        scope_key: _ScopeKey,
+        successful_tool_name: str,
+        successful_args: dict[str, Any],
+        result_content: str,
+    ) -> DPOPreferencePair | None:
+        """Pair a preceding negative action with the successful recovery action (DeLoop arXiv:2610.19376)."""
+        if not self.config.dpo_data_collection_enabled:
+            return None
+        with self._lock:
+            pending = self._pending_failures.pop(scope_key, None)
+            if pending is None:
+                return None
+
+            pair = DPOPreferencePair(
+                prompt_context=pending.prompt_context,
+                rejected_tool_name=pending.tool_name,
+                rejected_args=pending.args,
+                rejected_error=pending.error_signature,
+                chosen_tool_name=successful_tool_name,
+                chosen_args=dict(successful_args),
+                chosen_result_preview=result_content[:200],
+                timestamp=time.time(),
+            )
+            self._collected_dpo_pairs.append(pair)
+
+        if self.config.dpo_dataset_path:
+            try:
+                p = Path(self.config.dpo_dataset_path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(pair.to_dict(), ensure_ascii=False) + "\n")
+            except Exception:
+                logger.exception("Failed to persist DPO preference pair to %s", self.config.dpo_dataset_path)
+
+        logger.info(
+            "DeLoop flywheel: captured DPO preference pair for rejected '%s' -> chosen '%s'",
+            pair.rejected_tool_name,
+            pair.chosen_tool_name,
+        )
+        return pair
 
     def _get_history(self, scope_key: _ScopeKey) -> deque[_ToolRecord]:
         with self._lock:
@@ -305,6 +422,8 @@ class HarnessGuardMiddleware(AgentMiddleware):
 
         if err and self.config.block_on_syntax_error:
             tool_call_id = str(request.tool_call.get("id") or "missing-id")
+            scope_key = self._scope_key(request)
+            self._record_pending_failure(scope_key, tool_name, dict(args), err, "syntax_block")
             logger.warning("HarnessGuard blocked syntax-invalid write to %s: %s", file_path, err)
             msg = ToolMessage(
                 content=(f"[HARNESS GUARD: WRITE BLOCKED] Syntax validation failed for '{file_path}':\n{err}\nThe file was NOT written to prevent execution failures. Fix the syntax and retry."),
@@ -379,6 +498,16 @@ class HarnessGuardMiddleware(AgentMiddleware):
                     oscillation_warning = f"[HARNESS GUARD: OSCILLATION DETECTED] Alternating failing tool loop detected between '{r0.tool_name}' and '{r1.tool_name}'. Pause and re-evaluate your strategy."
 
             history.append(record)
+
+        call_args = request.tool_call.get("args") if isinstance(request.tool_call, dict) else getattr(request.tool_call, "args", {}) or {}
+        call_args_dict = dict(call_args) if isinstance(call_args, dict) else {}
+
+        if repetition_warning:
+            self._record_pending_failure(scope, tool_name, call_args_dict, sig_str or "repetition", "repetition")
+        elif oscillation_warning:
+            self._record_pending_failure(scope, tool_name, call_args_dict, "alternating_loop", "oscillation")
+        elif not is_error and getattr(result, "status", None) != "error":
+            self._resolve_and_collect_dpo(scope, tool_name, call_args_dict, raw_text)
 
         # Inject hints into ToolMessage content while preserving structured content blocks
         injected_parts: list[str] = []

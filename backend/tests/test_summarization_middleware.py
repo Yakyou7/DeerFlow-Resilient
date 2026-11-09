@@ -1838,3 +1838,48 @@ def test_first_turn_long_analysis_preserves_current_request() -> None:
     summarized_ids = [m.id for m in ev.messages_to_summarize]
     assert len(summarized_ids) > 0
     assert "ai1" in summarized_ids
+
+
+def test_extract_and_merge_pinned_constraints() -> None:
+    from deerflow.agents.middlewares.summarization_middleware import (
+        extract_pinned_constraints,
+        merge_pinned_constraints,
+    )
+
+    text = """The user asked to audit security.
+<pinned_constraints>
+- NEVER modify files in /etc/
+- DO NOT access external network
+</pinned_constraints>
+We performed initial review."""
+
+    constraints = extract_pinned_constraints(text)
+    assert len(constraints) == 2
+    assert "NEVER modify files in /etc/" in constraints
+    assert "DO NOT access external network" in constraints
+
+    # Test merge deduplication
+    merged = merge_pinned_constraints(["NEVER modify files in /etc/", "NO sudo"], text)
+    assert "<pinned_constraints>" in merged
+    assert "- NEVER modify files in /etc/" in merged
+    assert "- NO sudo" in merged
+    assert "- DO NOT access external network" in merged
+    assert "The user asked to audit security." in merged
+
+
+def test_bound_summary_carry_protects_pinned_constraints() -> None:
+    middleware = _middleware()
+    middleware.trim_tokens_to_summarize = 100
+    # Token counter lambda based on character length so carry budget (50 chars) triggers truncation
+    middleware.token_counter = lambda msgs: sum(len(str(getattr(m, "content", ""))) for m in msgs)
+
+    summary_with_pinned = (
+        "<pinned_constraints>\n- NEVER write to root\n</pinned_constraints>\n\n"
+        + "Historical work details: " + "W" * 200
+    )
+    bounded = middleware._bound_summary_carry(summary_with_pinned)
+    assert bounded is not None
+    # Pinned constraints must remain intact even when historical work details are shortened
+    assert "<pinned_constraints>" in bounded
+    assert "- NEVER write to root" in bounded
+    assert "[summary shortened]" in bounded

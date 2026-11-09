@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import tempfile
+import time
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -302,3 +303,89 @@ def test_sqlite_wal_mode_enabled(temp_aimem):
     with manager._indexer._connection() as conn:
         res = conn.execute("PRAGMA journal_mode;").fetchone()
         assert res[0].lower() == "wal"
+
+
+def test_sleep_time_compute_offline_crystallization(temp_aimem):
+    manager, tmp_dir = temp_aimem
+    manager._config.sleep_idle_debounce_seconds = 60.0
+
+    msg = [HumanMessage(content="Please remember that user prefers TypeScript over Python")]
+    manager.add("thread_sleep_1", msg, user_id="u_sleep1")
+
+    assert manager.pending_traces_count == 1
+
+    stats = manager.sleep_time_compute(user_id="u_sleep1")
+    assert stats["processed_traces"] == 1
+    assert stats["crystallized_facts"] == 1
+    assert manager.pending_traces_count == 0
+
+    facts = manager._storage.load_user_facts("u_sleep1")
+    assert len(facts) == 1
+    assert "TypeScript" in facts[0].content
+
+
+def test_sleep_time_compute_read_consistency_auto_drain(temp_aimem):
+    manager, tmp_dir = temp_aimem
+    manager._config.sleep_idle_debounce_seconds = 60.0
+
+    msg = [HumanMessage(content="Please remember that user prefers Neovim as code editor")]
+    manager.add("thread_sleep_2", msg, user_id="u_sleep2")
+    assert manager.pending_traces_count == 1
+
+    memory = manager.get_memory(user_id="u_sleep2")
+    assert manager.pending_traces_count == 0
+    assert len(memory["facts"]) == 1
+    assert "Neovim" in memory["facts"][0]["content"]
+
+
+def test_sleep_time_compute_background_timer_trigger(temp_aimem):
+    manager, tmp_dir = temp_aimem
+    manager._config.sleep_idle_debounce_seconds = 0.05
+
+    msg = [HumanMessage(content="Please remember that user prefers Dark Theme")]
+    manager.add("thread_sleep_3", msg, user_id="u_sleep3")
+
+    time.sleep(0.2)
+    assert manager.pending_traces_count == 0
+
+    results = manager.search("Dark Theme", user_id="u_sleep3")
+    assert len(results) == 1
+    assert "Dark Theme" in results[0]["content"]
+
+
+def test_sleep_time_compute_disabled_fallback_to_sync():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        manager = AimemMemoryManager.from_config(
+            backend_config={
+                "storage_path": tmp_dir,
+                "sleep_time_compute_enabled": False,
+            },
+            mode="middleware",
+        )
+        try:
+            msg = [HumanMessage(content="Please remember that user prefers VS Code")]
+            manager.add("thread_sleep_4", msg, user_id="u_sleep4")
+
+            assert manager.pending_traces_count == 0
+            facts = manager._storage.load_user_facts("u_sleep4")
+            assert len(facts) == 1
+            assert "VS Code" in facts[0].content
+        finally:
+            manager.close()
+
+
+def test_sleep_time_compute_shutdown_flush(temp_aimem):
+    manager, tmp_dir = temp_aimem
+    manager._config.sleep_idle_debounce_seconds = 60.0
+
+    msg = [HumanMessage(content="Please remember that user prefers PostgreSQL")]
+    manager.add("thread_sleep_5", msg, user_id="u_sleep5")
+    assert manager.pending_traces_count == 1
+
+    flushed = manager.shutdown_flush(timeout=2.0)
+    assert flushed is True
+    assert manager.pending_traces_count == 0
+
+    facts = manager._storage.load_user_facts("u_sleep5")
+    assert len(facts) == 1
+    assert "PostgreSQL" in facts[0].content
