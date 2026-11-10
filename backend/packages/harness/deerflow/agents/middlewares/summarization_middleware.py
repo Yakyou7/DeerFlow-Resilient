@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import html
 import logging
@@ -94,6 +95,36 @@ def _is_exempt_from_tool_pruning(msg: ToolMessage) -> bool:
     if "<handoff>" in content or "<subagent_handoff" in content:
         return True
     return False
+
+
+def _extract_python_ast_skeleton(code: str, max_chars: int = 1500) -> str | None:
+    """Extract class and function signatures as an AST code skeleton (Aider Repo Map style)."""
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return None
+
+    lines: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            ret = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+            lines.append(f"{prefix} {node.name}({ast.unparse(node.args)}){ret}: ...")
+        elif isinstance(node, ast.ClassDef):
+            lines.append(f"class {node.name}:")
+            methods = []
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    prefix = "async def" if isinstance(item, ast.AsyncFunctionDef) else "def"
+                    ret = f" -> {ast.unparse(item.returns)}" if item.returns else ""
+                    methods.append(f"    {prefix} {item.name}({ast.unparse(item.args)}){ret}: ...")
+            lines.extend(methods if methods else ["    ..."])
+    if not lines:
+        return None
+    skeleton = "\n".join(lines)
+    if len(skeleton) > max_chars:
+        skeleton = skeleton[:max_chars].rstrip() + "\n    ... [Remaining signatures omitted]"
+    return skeleton
 
 
 class _ReusedSummary(str):
@@ -1083,6 +1114,10 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         name = tool_name or "unknown"
         if isinstance(content, str):
             if len(content) > max_chars:
+                skeleton = _extract_python_ast_skeleton(content)
+                if skeleton:
+                    pruned_text = f"[AST Skeleton - {len(content)} chars folded, tool={name}]\n{skeleton}"
+                    return pruned_text, True
                 prefix_len = min(120, max(20, max_chars // 2))
                 pruned_text = f"{content[:prefix_len]}\n... [Output truncated: {len(content)} chars total, tool={name}]"
                 return pruned_text, True

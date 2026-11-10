@@ -260,3 +260,89 @@ def test_handoff_and_error_exemption_from_pruning():
     assert pruned[1].content.startswith("Detailed stack trace: EEEEE")
     # Regular tool output pruned
     assert "[Output truncated:" in pruned[2].content
+
+
+def test_tool_pruning_ast_skeleton_for_python_code():
+    middleware = _mock_middleware(
+        prune_tool_outputs=True,
+        max_tool_output_chars=100,
+        keep_recent_tool_turns=0,
+    )
+
+    py_code = """
+import os
+import sys
+
+CONSTANT = "SOME_VALUE"
+
+class AuthService:
+    def __init__(self, host: str = "localhost"):
+        self.host = host
+
+    def authenticate(self, user_id: str, token: str = "default") -> bool:
+        # Long implementation that should be omitted
+        if user_id == "admin":
+            return True
+        return False
+
+    async def fetch_profile(self, user_id: str):
+        pass
+
+def standalone_helper(x: int, y: int = 10) -> int:
+    result = x * y + 100
+    return result
+"""
+    t_code = ToolMessage(
+        content=py_code,
+        tool_call_id="call_py",
+        name="read_file",
+        id="msg_py",
+    )
+
+    pruned = middleware._prune_preserved_tool_outputs([t_code])
+    assert len(pruned) == 1
+    content = pruned[0].content
+    assert "[AST Skeleton -" in content
+    assert "chars folded, tool=read_file]" in content
+    # Class and method signatures preserved with type hints and defaults
+    assert "class AuthService:" in content
+    assert "def __init__(self, host: str='localhost'): ..." in content
+    assert "def authenticate(self, user_id: str, token: str='default') -> bool: ..." in content
+    assert "async def fetch_profile(self, user_id: str): ..." in content
+    assert "def standalone_helper(x: int, y: int=10) -> int: ..." in content
+    # Method implementation bodies omitted
+    assert "result = x * y + 100" not in content
+    assert 'CONSTANT = "SOME_VALUE"' not in content
+
+
+def test_tool_pruning_ast_fallback_for_non_python():
+    middleware = _mock_middleware(
+        prune_tool_outputs=True,
+        max_tool_output_chars=100,
+        keep_recent_tool_turns=0,
+    )
+
+    log_content = "2026-11-10 12:00:00 INFO Service started\n" + "Log line info debug trace data\n" * 20
+    t_log = ToolMessage(
+        content=log_content,
+        tool_call_id="call_log",
+        name="bash",
+        id="msg_log",
+    )
+
+    pruned = middleware._prune_preserved_tool_outputs([t_log])
+    assert len(pruned) == 1
+    content = pruned[0].content
+    assert "[Output truncated:" in content
+    assert "[AST Skeleton -" not in content
+
+
+def test_tool_pruning_ast_skeleton_size_bounding():
+    from deerflow.agents.middlewares.summarization_middleware import _extract_python_ast_skeleton
+
+    # Generate a python snippet with 100 functions
+    many_funcs = "\n".join(f"def func_{i}(arg_{i}: int) -> int:\n    return {i}" for i in range(100))
+    skeleton = _extract_python_ast_skeleton(many_funcs, max_chars=300)
+    assert skeleton is not None
+    assert len(skeleton) <= 350
+    assert "... [Remaining signatures omitted]" in skeleton
