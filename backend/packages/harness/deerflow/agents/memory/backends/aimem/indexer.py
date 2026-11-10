@@ -100,6 +100,10 @@ class FtsIndexer:
                 conn.execute("ALTER TABLE facts_meta ADD COLUMN access_count INTEGER DEFAULT 0;")
             if "last_accessed_at" not in columns:
                 conn.execute("ALTER TABLE facts_meta ADD COLUMN last_accessed_at TEXT;")
+            if "valid_from" not in columns:
+                conn.execute("ALTER TABLE facts_meta ADD COLUMN valid_from TEXT;")
+            if "invalidated_at" not in columns:
+                conn.execute("ALTER TABLE facts_meta ADD COLUMN invalidated_at TEXT;")
 
             try:
                 conn.execute(
@@ -132,12 +136,12 @@ class FtsIndexer:
             for f in facts:
                 conn.execute(
                     """
-                    INSERT INTO facts_meta (fact_id, user_id, category, content, confidence, created_at, updated_at, access_count, last_accessed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    INSERT INTO facts_meta (fact_id, user_id, category, content, confidence, created_at, updated_at, access_count, last_accessed_at, valid_from, invalidated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
-                    (f.id, user_id, f.category, f.content, f.confidence, f.created_at, f.updated_at, f.access_count, f.last_accessed_at),
+                    (f.id, user_id, f.category, f.content, f.confidence, f.created_at, f.updated_at, f.access_count, f.last_accessed_at, f.valid_from, f.invalidated_at),
                 )
-                if self._fts_available:
+                if self._fts_available and not f.invalidated_at:
                     try:
                         conn.execute(
                             """
@@ -162,12 +166,12 @@ class FtsIndexer:
 
             conn.execute(
                 """
-                INSERT INTO facts_meta (fact_id, user_id, category, content, confidence, created_at, updated_at, access_count, last_accessed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO facts_meta (fact_id, user_id, category, content, confidence, created_at, updated_at, access_count, last_accessed_at, valid_from, invalidated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                (fact.id, user_id, fact.category, fact.content, fact.confidence, fact.created_at, fact.updated_at, fact.access_count, fact.last_accessed_at),
+                (fact.id, user_id, fact.category, fact.content, fact.confidence, fact.created_at, fact.updated_at, fact.access_count, fact.last_accessed_at, fact.valid_from, fact.invalidated_at),
             )
-            if self._fts_available:
+            if self._fts_available and not fact.invalidated_at:
                 try:
                     conn.execute(
                         """
@@ -176,6 +180,20 @@ class FtsIndexer:
                         """,
                         (fact.id, user_id, fact.category, fact.content),
                     )
+                except Exception:
+                    pass
+            conn.commit()
+
+    def invalidate_fact(self, fact_id: str, invalidated_at: str) -> None:
+        """Mark a fact as invalidated in SQLite metadata and remove from active FTS index."""
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE facts_meta SET invalidated_at = ? WHERE fact_id = ?;",
+                (invalidated_at, fact_id),
+            )
+            if self._fts_available:
+                try:
+                    conn.execute("DELETE FROM aimem_fts WHERE fact_id = ?", (fact_id,))
                 except Exception:
                     pass
             conn.commit()
@@ -226,10 +244,12 @@ class FtsIndexer:
         raw_candidates: list[dict[str, Any]] = []
         sql = """
             SELECT f.fact_id, f.user_id, f.category, f.content, bm25(aimem_fts) as raw_bm25,
-                   m.confidence, m.created_at, m.updated_at, m.access_count, m.last_accessed_at
+                   m.confidence, m.created_at, m.updated_at, m.access_count, m.last_accessed_at,
+                   m.valid_from, m.invalidated_at
             FROM aimem_fts f
             LEFT JOIN facts_meta m ON f.fact_id = m.fact_id
             WHERE aimem_fts MATCH ?
+              AND (m.invalidated_at IS NULL OR m.invalidated_at = '')
         """
         params: list[Any] = [clean_query]
 
@@ -290,9 +310,11 @@ class FtsIndexer:
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT fact_id, user_id, category, content,
-                   confidence, created_at, updated_at, access_count, last_accessed_at
+                   confidence, created_at, updated_at, access_count, last_accessed_at,
+                   valid_from, invalidated_at
             FROM facts_meta
             WHERE content LIKE ?
+              AND (invalidated_at IS NULL OR invalidated_at = '')
         """
         params: list[Any] = [f"%{query.strip()}%"]
         if user_id:

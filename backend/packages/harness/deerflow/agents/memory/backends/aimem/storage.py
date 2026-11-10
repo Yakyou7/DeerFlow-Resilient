@@ -47,7 +47,7 @@ def _extract_topic_key(content: str) -> str | None:
 
 @dataclass
 class MemoryFact:
-    """A discrete unit of stored memory."""
+    """A discrete unit of stored memory with Bi-Temporal edge metadata."""
 
     id: str
     content: str
@@ -57,6 +57,23 @@ class MemoryFact:
     updated_at: str = ""
     access_count: int = 0
     last_accessed_at: str = ""
+    valid_from: str = ""
+    invalidated_at: str = ""
+
+    @property
+    def is_active(self) -> bool:
+        """Check if fact is currently active/valid (not invalidated)."""
+        return not bool(self.invalidated_at)
+
+    def is_valid_at(self, timestamp: str | None = None) -> bool:
+        """Point-in-time temporal evaluation (Zep Graphiti style)."""
+        if not timestamp:
+            return self.is_active
+        if self.valid_from and self.valid_from > timestamp:
+            return False
+        if self.invalidated_at and self.invalidated_at <= timestamp:
+            return False
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +85,8 @@ class MemoryFact:
             "updated_at": self.updated_at,
             "access_count": self.access_count,
             "last_accessed_at": self.last_accessed_at,
+            "valid_from": self.valid_from,
+            "invalidated_at": self.invalidated_at,
         }
 
 
@@ -139,6 +158,8 @@ class MarkdownStorage:
             updated = now
             accessed = ""
             count = 0
+            valid_from = ""
+            invalidated_at = ""
 
             meta_str = match.group("meta") or ""
             if meta_str:
@@ -153,6 +174,10 @@ class MarkdownStorage:
                             count = int(part.split(":", 1)[1].strip())
                         except ValueError:
                             count = 0
+                    elif part.startswith("valid_from:"):
+                        valid_from = part.split(":", 1)[1].strip()
+                    elif part.startswith("invalidated_at:"):
+                        invalidated_at = part.split(":", 1)[1].strip()
 
             facts.append(
                 MemoryFact(
@@ -164,6 +189,8 @@ class MarkdownStorage:
                     updated_at=updated,
                     access_count=count,
                     last_accessed_at=accessed or updated,
+                    valid_from=valid_from or updated,
+                    invalidated_at=invalidated_at,
                 )
             )
         return facts
@@ -175,6 +202,10 @@ class MarkdownStorage:
             meta_parts = []
             if f.updated_at:
                 meta_parts.append(f"updated: {f.updated_at}")
+            if f.valid_from:
+                meta_parts.append(f"valid_from: {f.valid_from}")
+            if f.invalidated_at:
+                meta_parts.append(f"invalidated_at: {f.invalidated_at}")
             if f.last_accessed_at:
                 meta_parts.append(f"accessed: {f.last_accessed_at}")
             if f.access_count > 0:
@@ -186,8 +217,15 @@ class MarkdownStorage:
         lines.append("")
         return "\n".join(lines)
 
-    def load_user_facts(self, user_id: str, category: str | None = None) -> list[MemoryFact]:
-        """Load all facts for a user, optionally filtered by category."""
+    def load_user_facts(
+        self,
+        user_id: str,
+        category: str | None = None,
+        *,
+        include_invalidated: bool = False,
+        as_of: str | None = None,
+    ) -> list[MemoryFact]:
+        """Load facts for a user, optionally filtered by category, active status or point-in-time."""
         with self._lock:
             user_dir = self._user_dir(user_id)
             categories = [category] if category else ["profile", "entity", "archive"]
@@ -197,7 +235,12 @@ class MarkdownStorage:
                 if file_path.is_file():
                     try:
                         text = file_path.read_text(encoding="utf-8")
-                        all_facts.extend(self.parse_markdown(text, default_category=cat))
+                        for f in self.parse_markdown(text, default_category=cat):
+                            if as_of:
+                                if f.is_valid_at(as_of):
+                                    all_facts.append(f)
+                            elif include_invalidated or f.is_active:
+                                all_facts.append(f)
                     except Exception:
                         pass
             return all_facts
@@ -235,6 +278,8 @@ class MarkdownStorage:
                 fact.updated_at = now
             if not fact.last_accessed_at:
                 fact.last_accessed_at = fact.updated_at
+            if not fact.valid_from:
+                fact.valid_from = fact.created_at or now
 
             new_topic = _extract_topic_key(fact.content)
             superseded_id: str | None = None
@@ -242,15 +287,19 @@ class MarkdownStorage:
             new_list: list[MemoryFact] = []
 
             for item in existing:
-                # 1. Exact ID or byte match
-                if item.id == fact.id or item.content.strip().lower() == fact.content.strip().lower():
+                # 1. Exact ID or byte match on an active fact
+                if (item.id == fact.id or item.content.strip().lower() == fact.content.strip().lower()) and not item.invalidated_at:
                     fact.access_count = max(fact.access_count, item.access_count)
+                    fact.valid_from = item.valid_from or fact.valid_from
                     new_list.append(fact)
                     replaced = True
-                # 2. Contradiction / Superseding match on topic prefix in the same category
-                elif new_topic is not None and _extract_topic_key(item.content) == new_topic:
+                # 2. Contradiction / Superseding match on topic prefix for an active fact
+                elif new_topic is not None and not item.invalidated_at and _extract_topic_key(item.content) == new_topic:
                     superseded_id = item.id
+                    item.invalidated_at = now
+                    new_list.append(item)  # Bi-Temporal: keep historical invalidated fact in Markdown
                     fact.access_count = max(fact.access_count, item.access_count + 1)
+                    fact.valid_from = now
                     new_list.append(fact)
                     replaced = True
                 else:
@@ -261,10 +310,15 @@ class MarkdownStorage:
 
             # Automatic staleness pruning if category facts exceed limit
             max_facts = self.config.max_facts_per_category
-            if len(new_list) > max_facts:
-                # Keep highest access count and most recently updated
-                new_list.sort(key=lambda x: (x.access_count, x.updated_at), reverse=True)
-                new_list = new_list[:max_facts]
+            active_facts = [f for f in new_list if not f.invalidated_at]
+            invalid_facts = [f for f in new_list if f.invalidated_at]
+            if len(active_facts) > max_facts:
+                active_facts.sort(key=lambda x: (x.access_count, x.updated_at), reverse=True)
+                active_facts = active_facts[:max_facts]
+            if len(invalid_facts) > max_facts:
+                invalid_facts.sort(key=lambda x: x.invalidated_at, reverse=True)
+                invalid_facts = invalid_facts[:max_facts]
+            new_list = active_facts + invalid_facts
 
             self.save_facts_for_category(user_id, category, new_list)
             return fact, superseded_id
@@ -277,7 +331,7 @@ class MarkdownStorage:
             id_set = set(fact_ids)
             now = datetime.datetime.now(datetime.UTC).isoformat()
             for cat in ["profile", "entity", "archive"]:
-                facts = self.load_user_facts(user_id, category=cat)
+                facts = self.load_user_facts(user_id, category=cat, include_invalidated=True)
                 changed = False
                 for f in facts:
                     if f.id in id_set:

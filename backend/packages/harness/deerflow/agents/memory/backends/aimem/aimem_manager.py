@@ -135,9 +135,9 @@ class AimemMemoryManager(MemoryManager):
                 )
                 saved_fact, superseded_id = self._storage.upsert_fact(uid, fact)
                 if superseded_id:
-                    self._indexer.delete_fact(superseded_id)
+                    self._indexer.invalidate_fact(superseded_id, invalidated_at=saved_fact.valid_from)
                     superseded_count += 1
-                    logger.info("Aimem superseded outdated fact: [%s]", superseded_id)
+                    logger.info("Aimem invalidated outdated fact: [%s]", superseded_id)
 
                 self._indexer.upsert_fact(uid, saved_fact)
                 crystallized_count += 1
@@ -375,11 +375,13 @@ class AimemMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        include_invalidated: bool = False,
+        as_of: str | None = None,
     ) -> dict[str, Any]:
         """Return memory in DeerMem-compatible schema."""
         uid = user_id or "default"
         self._ensure_crystallized(uid)
-        facts = self._storage.load_user_facts(uid)
+        facts = self._storage.load_user_facts(uid, include_invalidated=include_invalidated, as_of=as_of)
         now = datetime.datetime.now(datetime.UTC).isoformat()
         return {
             "version": "1.0",
@@ -448,7 +450,7 @@ class AimemMemoryManager(MemoryManager):
         for f in facts_to_save:
             saved, superseded_id = self._storage.upsert_fact(uid, f)
             if superseded_id:
-                self._indexer.delete_fact(superseded_id)
+                self._indexer.invalidate_fact(superseded_id, invalidated_at=saved.valid_from)
             self._indexer.upsert_fact(uid, saved)
         return self.get_memory(user_id=uid, agent_name=agent_name)
 
@@ -474,7 +476,7 @@ class AimemMemoryManager(MemoryManager):
         )
         saved, superseded_id = self._storage.upsert_fact(uid, fact)
         if superseded_id:
-            self._indexer.delete_fact(superseded_id)
+            self._indexer.invalidate_fact(superseded_id, invalidated_at=saved.valid_from)
         self._indexer.upsert_fact(uid, saved)
         return self.get_memory(user_id=uid, agent_name=agent_name), saved.id
 
@@ -514,7 +516,7 @@ class AimemMemoryManager(MemoryManager):
                 target.confidence = confidence
             saved, superseded_id = self._storage.upsert_fact(uid, target)
             if superseded_id and superseded_id != target.id:
-                self._indexer.delete_fact(superseded_id)
+                self._indexer.invalidate_fact(superseded_id, invalidated_at=saved.valid_from)
             self._indexer.upsert_fact(uid, saved)
         return self.get_memory(user_id=uid, agent_name=agent_name)
 
@@ -526,7 +528,7 @@ class AimemMemoryManager(MemoryManager):
     ) -> dict[str, Any]:
         """Resync FTS5 index from on-disk Markdown files (e.g. after manual human edits)."""
         uid = user_id or "default"
-        facts = self._storage.load_user_facts(uid)
+        facts = self._storage.load_user_facts(uid, include_invalidated=True)
         self._indexer.sync_user_facts(uid, facts)
         logger.info("Aimem reloaded and re-indexed %d facts for user %s", len(facts), uid)
         return self.get_memory(user_id=uid, agent_name=agent_name)

@@ -389,3 +389,99 @@ def test_sleep_time_compute_shutdown_flush(temp_aimem):
     facts = manager._storage.load_user_facts("u_sleep5")
     assert len(facts) == 1
     assert "PostgreSQL" in facts[0].content
+
+
+def test_bitemporal_fact_invalidation_markdown_persistence(temp_aimem):
+    manager, tmp_dir = temp_aimem
+
+    # Turn 1: Initial preference for PyTorch
+    msg1 = [HumanMessage(content="Please remember that my favorite framework is PyTorch")]
+    manager.add("t1", msg1, user_id="u_bitemp")
+
+    mem1 = manager.get_memory(user_id="u_bitemp")
+    assert len(mem1["facts"]) == 1
+    assert "PyTorch" in mem1["facts"][0]["content"]
+    assert mem1["facts"][0]["valid_from"] != ""
+    assert mem1["facts"][0]["invalidated_at"] == ""
+
+    # Turn 2: User explicitly changes preference to JAX
+    msg2 = [HumanMessage(content="Please remember that my favorite framework is JAX")]
+    manager.add("t2", msg2, user_id="u_bitemp")
+
+    # 1. Default get_memory only returns currently active facts (JAX)
+    mem2 = manager.get_memory(user_id="u_bitemp")
+    assert len(mem2["facts"]) == 1
+    assert "JAX" in mem2["facts"][0]["content"]
+
+    # 2. Including invalidated facts returns full bi-temporal history (PyTorch + JAX)
+    all_facts = manager.get_memory(user_id="u_bitemp", include_invalidated=True)["facts"]
+    assert len(all_facts) == 2
+    contents = {f["content"]: f for f in all_facts}
+    assert "my favorite framework is PyTorch" in contents
+    assert "my favorite framework is JAX" in contents
+
+    # PyTorch has invalidated_at set
+    assert contents["my favorite framework is PyTorch"]["invalidated_at"] != ""
+    # JAX remains active without invalidated_at
+    assert contents["my favorite framework is JAX"]["invalidated_at"] == ""
+
+    # 3. Verify physical Markdown file on disk retains both facts with comment metadata
+    profile_md = manager._storage._file_for_category(manager._storage._user_dir("u_bitemp"), "profile")
+    md_text = profile_md.read_text(encoding="utf-8")
+    assert "my favorite framework is PyTorch" in md_text
+    assert "my favorite framework is JAX" in md_text
+    assert "invalidated_at:" in md_text
+
+
+def test_bitemporal_fts_search_isolation(temp_aimem):
+    manager, tmp_dir = temp_aimem
+
+    manager.add("t1", [HumanMessage(content="Please remember that my favorite framework is PyTorch")], user_id="u_bitemp_search")
+    manager.add("t2", [HumanMessage(content="Please remember that my favorite framework is JAX")], user_id="u_bitemp_search")
+
+    # Search for outdated framework PyTorch -> 0 results (isolated from FTS search index)
+    results_old = manager.search("PyTorch", user_id="u_bitemp_search")
+    assert len(results_old) == 0
+
+    # Search for active framework JAX -> 1 result
+    results_new = manager.search("JAX", user_id="u_bitemp_search")
+    assert len(results_new) == 1
+    assert "JAX" in results_new[0]["content"]
+
+
+def test_bitemporal_point_in_time_query(temp_aimem):
+    manager, tmp_dir = temp_aimem
+    from deerflow.agents.memory.backends.aimem.storage import MemoryFact
+
+    # Explicitly create facts with fixed temporal timestamps
+    fact_old = MemoryFact(
+        id="f_past",
+        content="Primary database is MySQL",
+        category="entity",
+        valid_from="2026-01-01T00:00:00Z",
+        invalidated_at="2026-06-01T00:00:00Z",
+    )
+    fact_new = MemoryFact(
+        id="f_curr",
+        content="Primary database is PostgreSQL",
+        category="entity",
+        valid_from="2026-06-01T00:00:00Z",
+        invalidated_at="",
+    )
+
+    manager._storage.save_facts_for_category("u_time", "entity", [fact_old, fact_new])
+    manager.reload_memory(user_id="u_time")
+
+    # Point in time query: at 2026-03-01 (before migration), MySQL was active
+    past_view = manager.get_memory(user_id="u_time", as_of="2026-03-01T00:00:00Z")["facts"]
+    assert len(past_view) == 1
+    assert "MySQL" in past_view[0]["content"]
+
+    # Point in time query: at 2026-08-01 (after migration), PostgreSQL was active
+    curr_view = manager.get_memory(user_id="u_time", as_of="2026-08-01T00:00:00Z")["facts"]
+    assert len(curr_view) == 1
+    assert "PostgreSQL" in curr_view[0]["content"]
+
+    # Point in time query: before 2026-01-01 (no facts existed)
+    ancient_view = manager.get_memory(user_id="u_time", as_of="2025-12-31T00:00:00Z")["facts"]
+    assert len(ancient_view) == 0
