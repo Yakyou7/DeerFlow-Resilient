@@ -269,12 +269,6 @@ def resolve_workspace_repo_root(runtime: Any, config_root: str | None = None) ->
             ws = ctx.get("workspace_path") or ctx.get("repo_root")
             if ws and Path(ws).exists():
                 return Path(ws)
-    try:
-        cwd = Path.cwd()
-        if (cwd / ".git").exists():
-            return cwd
-    except Exception:
-        pass
     return None
 
 
