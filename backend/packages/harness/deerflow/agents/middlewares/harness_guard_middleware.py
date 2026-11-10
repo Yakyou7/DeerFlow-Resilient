@@ -14,8 +14,10 @@ import ast
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -248,6 +250,99 @@ class _ToolRecord:
     error_signature: str | None
 
 
+def resolve_workspace_repo_root(runtime: Any, config_root: str | None = None) -> Path | None:
+    """Resolve the working git repository root for the current tool execution."""
+    if config_root:
+        p = Path(config_root)
+        if p.exists():
+            return p
+    if runtime is not None:
+        state = getattr(runtime, "state", None)
+        if isinstance(state, dict):
+            thread_data = state.get("thread_data")
+            if isinstance(thread_data, dict):
+                ws = thread_data.get("workspace_path")
+                if ws and Path(ws).exists():
+                    return Path(ws)
+        ctx = getattr(runtime, "context", None)
+        if isinstance(ctx, dict):
+            ws = ctx.get("workspace_path") or ctx.get("repo_root")
+            if ws and Path(ws).exists():
+                return Path(ws)
+    try:
+        cwd = Path.cwd()
+        if (cwd / ".git").exists():
+            return cwd
+    except Exception:
+        pass
+    return None
+
+
+class GitSnapshotManager:
+    """Manages lightweight Git snapshots and rollbacks (SWE-Search-style)."""
+
+    @staticmethod
+    def _run_git(args: list[str], cwd: Path | str, timeout: float = 15.0) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_PAGER"] = "cat"
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def is_git_repo(cls, path: Path | str | None) -> bool:
+        if not path:
+            return False
+        p = Path(path)
+        if not p.exists():
+            return False
+        res = cls._run_git(["rev-parse", "--is-inside-work-tree"], cwd=p)
+        return res.returncode == 0 and res.stdout.strip() == "true"
+
+    @classmethod
+    def create_snapshot(cls, repo_root: Path | str) -> str | None:
+        """Create a lightweight snapshot of current git workspace state."""
+        if not cls.is_git_repo(repo_root):
+            return None
+        status = cls._run_git(["status", "--porcelain"], cwd=repo_root)
+        if status.returncode != 0:
+            return None
+        if not status.stdout.strip():
+            head = cls._run_git(["rev-parse", "HEAD"], cwd=repo_root)
+            return head.stdout.strip() if head.returncode == 0 else None
+
+        cls._run_git(["add", "-A"], cwd=repo_root)
+        tree = cls._run_git(["write-tree"], cwd=repo_root)
+        if tree.returncode != 0:
+            return None
+        head = cls._run_git(["rev-parse", "HEAD"], cwd=repo_root)
+        parents = ["-p", head.stdout.strip()] if head.returncode == 0 and head.stdout.strip() else []
+        commit = cls._run_git(["commit-tree", tree.stdout.strip(), *parents, "-m", "HarnessGuard snapshot"], cwd=repo_root)
+        return commit.stdout.strip() if commit.returncode == 0 else None
+
+    @classmethod
+    def rollback_to_snapshot(cls, repo_root: Path | str, snapshot_id: str) -> bool:
+        """Hard reset workspace to snapshot and clean untracked files."""
+        if not cls.is_git_repo(repo_root) or not snapshot_id:
+            return False
+        reset = cls._run_git(["reset", "--hard", snapshot_id], cwd=repo_root)
+        if reset.returncode != 0:
+            logger.warning("Git snapshot rollback reset failed: %s", reset.stderr)
+            return False
+        clean = cls._run_git(["clean", "-fd"], cwd=repo_root)
+        if clean.returncode != 0:
+            logger.warning("Git snapshot clean failed: %s", clean.stderr)
+        return True
+
+
 class HarnessGuardMiddleware(AgentMiddleware):
     """Tool-loop interceptor for write syntax verification, error hints, and anti-doom-loop."""
 
@@ -261,6 +356,8 @@ class HarnessGuardMiddleware(AgentMiddleware):
         # DeLoop Flywheel: bounded tracking of pending failures awaiting recovery
         self._pending_failures: BoundedDict[_ScopeKey, _PendingFailure] = BoundedDict(maxsize=self.config.max_tracked_scopes)
         self._collected_dpo_pairs: deque[DPOPreferencePair] = deque(maxlen=1000)
+        # SWE-Search Git Snapshots: bounded tracking of last known healthy snapshot per scope
+        self._snapshots: BoundedDict[_ScopeKey, str] = BoundedDict(maxsize=self.config.max_tracked_scopes)
 
     @property
     def collected_dpo_pairs(self) -> list[DPOPreferencePair]:
@@ -502,6 +599,48 @@ class HarnessGuardMiddleware(AgentMiddleware):
         call_args = request.tool_call.get("args") if isinstance(request.tool_call, dict) else getattr(request.tool_call, "args", {}) or {}
         call_args_dict = dict(call_args) if isinstance(call_args, dict) else {}
 
+        repo_root = resolve_workspace_repo_root(request.runtime, self.config.workspace_root)
+
+        # Baseline snapshot initialization if none recorded yet for this scope
+        if self.config.git_snapshot_enabled and repo_root:
+            with self._lock:
+                has_snapshot = scope in self._snapshots
+            if not has_snapshot:
+                initial_snap = GitSnapshotManager.create_snapshot(repo_root)
+                if initial_snap:
+                    with self._lock:
+                        self._snapshots[scope] = initial_snap
+
+        # If current action succeeded, refresh healthy snapshot
+        if self.config.git_snapshot_enabled and not is_error and getattr(result, "status", None) != "error" and repo_root:
+            try:
+                snap_id = GitSnapshotManager.create_snapshot(repo_root)
+                if snap_id:
+                    with self._lock:
+                        self._snapshots[scope] = snap_id
+            except Exception:
+                logger.debug("Failed to record Git snapshot for scope %s", scope)
+
+        # SWE-Search Rollback on critical repetition or oscillation loop
+        workspace_rolled_back = False
+        restored_snapshot_id: str | None = None
+        if repetition_warning or oscillation_warning:
+            if self.config.git_rollback_on_loop and repo_root:
+                with self._lock:
+                    snapshot_id = self._snapshots.get(scope)
+                if snapshot_id:
+                    try:
+                        if GitSnapshotManager.rollback_to_snapshot(repo_root, snapshot_id):
+                            workspace_rolled_back = True
+                            restored_snapshot_id = snapshot_id
+                            logger.warning(
+                                "HarnessGuard triggered SWE-Search git rollback to snapshot %s for scope %s",
+                                snapshot_id,
+                                scope,
+                            )
+                    except Exception:
+                        logger.exception("Error during HarnessGuard git rollback")
+
         if repetition_warning:
             self._record_pending_failure(scope, tool_name, call_args_dict, sig_str or "repetition", "repetition")
         elif oscillation_warning:
@@ -517,6 +656,13 @@ class HarnessGuardMiddleware(AgentMiddleware):
             injected_parts.append(repetition_warning)
         if oscillation_warning:
             injected_parts.append(oscillation_warning)
+        if workspace_rolled_back and restored_snapshot_id:
+            rollback_notice = (
+                f"[HARNESS GUARD: WORKSPACE ROLLED BACK] Persistent loop detected. "
+                f"Working directory hard-reset to clean snapshot '{restored_snapshot_id[:8]}'. "
+                f"Corrupted edits and temporary files were reverted. Formulate a new hypothesis and fresh approach."
+            )
+            injected_parts.append(rollback_notice)
 
         if injected_parts:
             hint_block_text = "\n\n" + "\n".join(injected_parts)
@@ -539,6 +685,8 @@ class HarnessGuardMiddleware(AgentMiddleware):
                     "error_signature": sig_str,
                     "repetition_warning": repetition_warning is not None,
                     "oscillation_warning": oscillation_warning is not None,
+                    "workspace_rolled_back": workspace_rolled_back,
+                    "snapshot_restored": restored_snapshot_id,
                 }
             )
 

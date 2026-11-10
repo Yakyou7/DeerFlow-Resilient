@@ -517,3 +517,128 @@ class TestHarnessGuardMiddleware:
         data = json.loads(lines[0])
         assert data["rejected"]["tool"] == "write_file"
         assert data["chosen"]["tool"] == "write_file"
+
+
+class TestGitSnapshotAndRollback:
+    def test_harness_guard_git_snapshot_and_rollback_on_repetition(self):
+        import subprocess, tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "TestUser"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            calc_file = repo / "calc.py"
+            calc_file.write_text("def add(a, b): return a + b\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo, check=True)
+
+            config = HarnessGuardConfig(
+                git_snapshot_enabled=True,
+                git_rollback_on_loop=True,
+                workspace_root=str(repo),
+                max_repeated_error_signatures=2,
+            )
+            middleware = HarnessGuardMiddleware(config)
+
+            # Turn 1: Initial successful tool call records healthy snapshot
+            req1 = _make_request("bash", {"command": "python calc.py"})
+            res1 = middleware.wrap_tool_call(req1, lambda r: ToolMessage(content="Calculation ok", tool_call_id=r.tool_call["id"], name="bash"))
+            assert HARNESS_GUARD_KEY not in res1.additional_kwargs or not res1.additional_kwargs[HARNESS_GUARD_KEY].get("workspace_rolled_back")
+
+            # Corrupt file and add a broken untracked file
+            calc_file.write_text("def add(a, b): broken syntax :::\n", encoding="utf-8")
+            junk_file = repo / "junk_temp.tmp"
+            junk_file.write_text("garbage junk\n", encoding="utf-8")
+
+            # Turn 2: First error
+            req2 = _make_request("bash", {"command": "python calc.py"}, tool_call_id="call-2")
+            res2 = middleware.wrap_tool_call(req2, lambda r: ToolMessage(content="SyntaxError: invalid syntax (line 1)", tool_call_id=r.tool_call["id"], name="bash", status="error"))
+            assert not res2.additional_kwargs.get(HARNESS_GUARD_KEY, {}).get("workspace_rolled_back", False)
+
+            # Turn 3: Second identical error -> triggers repetition loop warning AND Git rollback!
+            req3 = _make_request("bash", {"command": "python calc.py"}, tool_call_id="call-3")
+            res3 = middleware.wrap_tool_call(req3, lambda r: ToolMessage(content="SyntaxError: invalid syntax (line 1)", tool_call_id=r.tool_call["id"], name="bash", status="error"))
+
+            # Assertions
+            assert "[HARNESS GUARD: WORKSPACE ROLLED BACK]" in res3.content
+            guard_meta = res3.additional_kwargs[HARNESS_GUARD_KEY]
+            assert guard_meta["workspace_rolled_back"] is True
+            assert guard_meta["snapshot_restored"] is not None
+
+            # Verify physical workspace has been restored
+            assert calc_file.read_text(encoding="utf-8") == "def add(a, b): return a + b\n"
+            assert not junk_file.exists()
+
+    def test_harness_guard_git_rollback_on_oscillation(self):
+        import subprocess, tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "TestUser"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            code_file = repo / "app.py"
+            code_file.write_text("print('healthy')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo, check=True)
+
+            config = HarnessGuardConfig(
+                git_snapshot_enabled=True,
+                git_rollback_on_loop=True,
+                workspace_root=str(repo),
+                detect_alternating_loops=True,
+            )
+            middleware = HarnessGuardMiddleware(config)
+
+            # Establish initial healthy baseline
+            req_init = _make_request("bash", {"command": "python app.py"})
+            middleware.wrap_tool_call(req_init, lambda r: ToolMessage(content="healthy", tool_call_id=r.tool_call["id"], name="bash"))
+
+            # Corrupt workspace
+            code_file.write_text("corrupted code\n", encoding="utf-8")
+            corrupt_artifact = repo / "artifact.bad"
+            corrupt_artifact.write_text("bad data", encoding="utf-8")
+
+            # A -> B -> A -> B loop
+            r_t1a = _make_request("tool_a", {"cmd": "run_a"}, tool_call_id="call-a1")
+            middleware.wrap_tool_call(r_t1a, lambda r: ToolMessage(content="Failed A", tool_call_id=r.tool_call["id"], name="tool_a", status="error"))
+            r_t1b = _make_request("tool_b", {"cmd": "run_b"}, tool_call_id="call-b1")
+            middleware.wrap_tool_call(r_t1b, lambda r: ToolMessage(content="Failed B", tool_call_id=r.tool_call["id"], name="tool_b", status="error"))
+            r_t2a = _make_request("tool_a", {"cmd": "run_a"}, tool_call_id="call-a2")
+            middleware.wrap_tool_call(r_t2a, lambda r: ToolMessage(content="Failed A", tool_call_id=r.tool_call["id"], name="tool_a", status="error"))
+            r_t2b = _make_request("tool_b", {"cmd": "run_b"}, tool_call_id="call-b2")
+            res_osc = middleware.wrap_tool_call(r_t2b, lambda r: ToolMessage(content="Failed B", tool_call_id=r.tool_call["id"], name="tool_b", status="error"))
+
+            assert "[HARNESS GUARD: OSCILLATION DETECTED]" in res_osc.content
+            assert "[HARNESS GUARD: WORKSPACE ROLLED BACK]" in res_osc.content
+            assert res_osc.additional_kwargs[HARNESS_GUARD_KEY]["workspace_rolled_back"] is True
+            assert code_file.read_text(encoding="utf-8") == "print('healthy')\n"
+            assert not corrupt_artifact.exists()
+
+    def test_harness_guard_git_rollback_non_git_fail_open(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            # Non-git directory
+            config = HarnessGuardConfig(
+                git_snapshot_enabled=True,
+                git_rollback_on_loop=True,
+                workspace_root=td,
+                max_repeated_error_signatures=2,
+            )
+            middleware = HarnessGuardMiddleware(config)
+
+            req1 = _make_request("bash", {"command": "test"})
+            middleware.wrap_tool_call(req1, lambda r: ToolMessage(content="SyntaxError: invalid syntax (line 1)", tool_call_id=r.tool_call["id"], name="bash", status="error"))
+            req2 = _make_request("bash", {"command": "test"}, tool_call_id="call-2")
+            res2 = middleware.wrap_tool_call(req2, lambda r: ToolMessage(content="SyntaxError: invalid syntax (line 1)", tool_call_id=r.tool_call["id"], name="bash", status="error"))
+
+            # Repetition detected without crashing
+            assert "[HARNESS GUARD: CRITICAL REPETITION]" in res2.content
+            # Rollback gracefully skipped since it is not a git repo
+            assert res2.additional_kwargs[HARNESS_GUARD_KEY].get("workspace_rolled_back") is False

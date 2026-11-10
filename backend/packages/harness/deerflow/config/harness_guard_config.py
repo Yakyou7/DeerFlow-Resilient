@@ -52,3 +52,15 @@ class HarnessGuardConfig(BaseModel):
         default=None,
         description="Optional local filesystem path for append-only JSONL persistence of DPO training pairs",
     )
+    git_snapshot_enabled: bool = Field(
+        default=True,
+        description="Whether to track workspace Git snapshots on successful actions (SWE-Search-style)",
+    )
+    git_rollback_on_loop: bool = Field(
+        default=True,
+        description="Whether to trigger Git hard rollback to the last healthy snapshot when a loop is detected",
+    )
+    workspace_root: str | None = Field(
+        default=None,
+        description="Optional explicit root directory for the Git workspace",
+    )
