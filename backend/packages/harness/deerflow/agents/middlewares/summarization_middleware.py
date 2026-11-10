@@ -81,6 +81,31 @@ def merge_pinned_constraints(existing_constraints: list[str], new_text: str) -> 
     return pinned_block
 
 
+def extract_task_ledger_blocks(text: str) -> list[str]:
+    """Extract <task_ledger> blocks to protect them during summary compression (Magentic-One style)."""
+    if not text:
+        return []
+    return re.findall(r"<task_ledger>.*?</task_ledger>", text, flags=re.DOTALL | re.IGNORECASE)
+
+
+def merge_task_ledger_blocks(existing_blocks: list[str], new_text: str) -> str:
+    """Ensure task ledger blocks are preserved across summary compactions."""
+    new_blocks = extract_task_ledger_blocks(new_text)
+    all_blocks = list(existing_blocks)
+    for b in new_blocks:
+        if b not in all_blocks:
+            all_blocks.append(b)
+
+    cleaned_text = re.sub(r"<task_ledger>.*?</task_ledger>", "", new_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not all_blocks:
+        return cleaned_text
+
+    ledger_block = "\n\n".join(all_blocks)
+    if cleaned_text:
+        return f"{cleaned_text}\n\n{ledger_block}"
+    return ledger_block
+
+
 def _is_exempt_from_tool_pruning(msg: ToolMessage) -> bool:
     """Exempt error messages and subagent typed handoffs (<handoff>) from tool output pruning (OMA)."""
     if getattr(msg, "status", None) == "error":
@@ -653,6 +678,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         # The complete candidate (including its marker) is measured. An
         # impossibly small budget fails instead of producing an empty carry.
         pinned = extract_pinned_constraints(text)
+        task_ledgers = extract_task_ledger_blocks(text)
         low, high, bounded = 2, len(text) - 1, None
         while low <= high:
             middle = (low + high) // 2
@@ -667,6 +693,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             logger.debug("Summary carry shortened: carry_tokens=%d bounded_tokens=%d carry_budget=%d input_budget=%d", tokens, self._summary_text_tokens(bounded), carry_budget, budget)
             if pinned:
                 bounded = merge_pinned_constraints(pinned, bounded)
+            if task_ledgers:
+                bounded = merge_task_ledger_blocks(task_ledgers, bounded)
         return bounded
 
     def _summary_retry_key(self, runtime: Runtime | None, messages: list[AnyMessage], previous_summary: str | None) -> str | None:
