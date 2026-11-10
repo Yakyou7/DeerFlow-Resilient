@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import html
 import logging
+import re
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -18,7 +19,14 @@ from deerflow_extension_api import CompactionEvent, ExtensionData, canonical_has
 from langchain.agents import AgentState
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain.agents.middleware.summarization import DEFAULT_SUMMARY_PROMPT
-from langchain_core.messages import AnyMessage, HumanMessage, RemoveMessage, SystemMessage, get_buffer_string
+from langchain_core.messages import (
+    AnyMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+    get_buffer_string,
+)
 from langchain_core.runnables import RunnableBinding
 from langgraph.config import get_config
 from langgraph.constants import TAG_NOSTREAM
@@ -29,6 +37,9 @@ from deerflow.agents.middlewares.dynamic_context_middleware import is_dynamic_co
 from deerflow.agents.middlewares.message_utils import is_genuine_user_message
 from deerflow.agents.middlewares.pii_redaction_middleware import redact_text
 from deerflow.agents.middlewares.todo_middleware import TODO_REMINDER_MESSAGE_NAME
+from deerflow.agents.middlewares.tool_call_args import pair_tool_call_results
+from deerflow.agents.middlewares.tool_output_budget_middleware import TOOL_OUTPUT_BLOB_KEY, _keep_exit_marker_last
+from deerflow.agents.middlewares.tool_transform_meta import append_tool_transform, read_tool_transforms
 from deerflow.config.app_config import get_app_config
 from deerflow.config.summarization_config import DEFAULT_KEEP
 from deerflow.config.task_continuity_config import TaskContinuityConfig
@@ -51,6 +62,14 @@ _SUMMARY_CHUNK_RETRY_MAX_ENTRIES = 128
 _SUMMARY_CHUNK_RETRY_CACHE: OrderedDict[str, tuple[float, int]] = OrderedDict()
 _SUMMARY_CHUNK_RETRY_LOCK = threading.Lock()
 _SHORTENED_SUMMARY_MARKER = "\n[summary shortened]\n"
+_EXTERNALIZED_HEADER_RE = re.compile(
+    r"^(\[Full [^\r\n]+ output saved to ([^\r\n]+?) \(\d[\d,]* chars, ~\d[\d,]* tokens\)\.\])",
+    re.MULTILINE,
+)
+_EXTERNALIZED_ACCESS_RE = re.compile(
+    r"^- Use read_file on ([^\r\n]+?) with start_line and end_line to inspect the raw output\.",
+    re.MULTILINE,
+)
 _DEERFLOW_SUMMARY_PROMPT = DEFAULT_SUMMARY_PROMPT.replace(
     "</instructions>",
     "## ACTIVE USER REQUIREMENTS\n\n"
@@ -190,9 +209,15 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         anchor_model_name: str | None = _UNSET,  # type: ignore[assignment]
         prebuilt_models: Mapping[str | None, Any | None] | None = None,
         extensions=None,
+        prune_tool_outputs: bool = False,
+        max_tool_output_chars: int = 300,
+        keep_recent_tool_turns: int = 2,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._prune_tool_outputs = prune_tool_outputs
+        self._max_tool_output_chars = max_tool_output_chars
+        self._keep_recent_tool_turns = keep_recent_tool_turns
         run_model = self.model
         seen_bindings: set[int] = set()
         while isinstance(run_model, RunnableBinding) and id(run_model) not in seen_bindings:
@@ -269,6 +294,9 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             "trigger": plain_size(self.trigger),
             "keep": plain_size(self.keep),
             "trim_tokens_to_summarize": self.trim_tokens_to_summarize,
+            "prune_tool_outputs": self._prune_tool_outputs,
+            "max_tool_output_chars": self._max_tool_output_chars,
+            "keep_recent_tool_turns": self._keep_recent_tool_turns,
             "source_coverage": "chronological_chunks",
             "max_summary_chunks": _MAX_SUMMARY_CHUNKS,
             "chunk_limit_retry_seconds": _SUMMARY_CHUNK_RETRY_SECONDS,
@@ -966,6 +994,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         if prepared is None:
             return None
         messages_to_summarize, preserved_messages, previous_summary, total_tokens = prepared
+        preserved_messages = self._prune_preserved_tool_outputs(preserved_messages)
         source_content_hashes = self._freeze_compaction_sources(messages_to_summarize)
         summary = self._summarize_with(messages_to_summarize, previous_summary=previous_summary, runtime=runtime)
         if summary is None:
@@ -1013,6 +1042,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         if prepared is None:
             return None
         messages_to_summarize, preserved_messages, previous_summary, total_tokens = prepared
+        preserved_messages = self._prune_preserved_tool_outputs(preserved_messages)
         task_store = task_store_from_runtime(runtime)
         source_content_hashes = self._freeze_compaction_sources(messages_to_summarize)
         summary = await self._asummarize_with(
@@ -1110,6 +1140,166 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             else:
                 remaining.append(msg)
         return remaining, rescued + preserved_messages
+
+    @staticmethod
+    def _fold_externalized_text(
+        text: str,
+        *,
+        max_chars: int,
+        tool_name: str,
+        blob_vpath: str | None,
+    ) -> str | None:
+        """Fold an externalized preview down to its file-reference pointer."""
+        if len(text) <= max_chars:
+            return None
+
+        header_match = _EXTERNALIZED_HEADER_RE.search(text)
+        access_match = _EXTERNALIZED_ACCESS_RE.search(text)
+        if header_match is None and access_match is None:
+            return None
+
+        virtual_path = (header_match.group(2) if header_match is not None else None) or (access_match.group(1) if access_match is not None else None) or blob_vpath
+        if not virtual_path:
+            return None
+
+        header = header_match.group(1) if header_match is not None else f"[Full {tool_name} output saved to {virtual_path} ({len(text)} chars, ~{len(text) // 4} tokens).]"
+        folded = f"{header}\n[Preview folded during compaction]\nAccess:\n- Use read_file on {virtual_path} with start_line and end_line to inspect the raw output."
+        folded = _keep_exit_marker_last(text, folded, tool_name=tool_name)
+        if len(folded) >= len(text):
+            return None
+        return folded
+
+    @staticmethod
+    def _text_char_len(content: Any) -> int:
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            return sum(len(part) if isinstance(part, str) else (len(part["text"]) if isinstance(part, Mapping) and isinstance(part.get("text"), str) else 0) for part in content)
+        return 0
+
+    @classmethod
+    def _prune_tool_message_content(
+        cls,
+        content: Any,
+        max_chars: int,
+        tool_name: str | None,
+        *,
+        blob_vpath: str | None = None,
+    ) -> tuple[Any, bool]:
+        """Fold an externalized ToolMessage preview while preserving its reference.
+
+        Un-externalized payloads (no canonical header/access pointer or blob path)
+        are returned unmodified so no unpersisted tool data is ever lost.
+        """
+        name = tool_name or "unknown"
+        if isinstance(content, str):
+            folded = cls._fold_externalized_text(
+                content,
+                max_chars=max_chars,
+                tool_name=name,
+                blob_vpath=blob_vpath,
+            )
+            return (folded, True) if folded is not None else (content, False)
+
+        if isinstance(content, list):
+            text_pieces: list[str] = []
+            retained: list[Any] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_pieces.append(part)
+                elif isinstance(part, Mapping) and isinstance(part.get("text"), str) and part.get("type", "text") == "text":
+                    text_pieces.append(part["text"])
+                else:
+                    retained.append(part)
+            combined_text = "\n".join(text_pieces) if len(text_pieces) > 1 else (text_pieces[0] if text_pieces else "")
+            if not combined_text:
+                return content, False
+            folded = cls._fold_externalized_text(
+                combined_text,
+                max_chars=max_chars,
+                tool_name=name,
+                blob_vpath=blob_vpath,
+            )
+            if folded is None:
+                return content, False
+            new_content: list[Any] = [{"type": "text", "text": folded}, *retained] if retained else [{"type": "text", "text": folded}]
+            return new_content, True
+
+        return content, False
+
+    def _prune_preserved_tool_outputs(self, preserved_messages: list[AnyMessage]) -> list[AnyMessage]:
+        """Fold older externalized ToolMessage previews in preserved_messages."""
+        if not self._prune_tool_outputs:
+            return preserved_messages
+        tool_messages = [m for m in preserved_messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
+            return preserved_messages
+
+        # Pair each ToolMessage with its issuing AIMessage occurrence so providers
+        # that reuse tool_call_ids across turns (e.g. "call_0") never merge turns.
+        msg_to_turn = {id(occ.result): occ.index for occ in pair_tool_call_results(preserved_messages) if occ.result is not None}
+
+        # Group tool message indices by execution turn
+        turn_groups: dict[Any, list[int]] = {}
+        for i, msg in enumerate(preserved_messages):
+            if isinstance(msg, ToolMessage):
+                t_id = msg_to_turn.get(id(msg), f"standalone_{i}")
+                turn_groups.setdefault(t_id, []).append(i)
+
+        ordered_turns = list(turn_groups.values())
+        protected_indices: set[int] = set()
+        if self._keep_recent_tool_turns > 0 and ordered_turns:
+            for turn_indices in ordered_turns[-self._keep_recent_tool_turns :]:
+                protected_indices.update(turn_indices)
+
+        max_chars = self._max_tool_output_chars
+
+        result: list[AnyMessage] = []
+        for i, m in enumerate(preserved_messages):
+            if i in protected_indices or not isinstance(m, ToolMessage) or getattr(m, "status", None) == "error":
+                result.append(m)
+                continue
+
+            transforms = read_tool_transforms(m)
+            if any(tr.get("kind") == "pruned" for tr in transforms):
+                result.append(m)
+                continue
+
+            kwargs = getattr(m, "additional_kwargs", None) or {}
+            blob_meta = kwargs.get(TOOL_OUTPUT_BLOB_KEY)
+            blob_vpath = blob_meta.get("virtual_path") if isinstance(blob_meta, Mapping) and isinstance(blob_meta.get("virtual_path"), str) else None
+            has_ext_transform = any(tr.get("kind") == "externalized" for tr in transforms)
+            if not has_ext_transform and not blob_vpath:
+                result.append(m)
+                continue
+
+            pruned_content, was_pruned = self._prune_tool_message_content(
+                m.content,
+                max_chars,
+                m.name,
+                blob_vpath=blob_vpath,
+            )
+            if was_pruned:
+                chars_saved = self._text_char_len(m.content) - self._text_char_len(pruned_content)
+                logger.info(
+                    "context/replace: folded externalized tool output for tool_call_id=%s (name=%s, saved %d chars)",
+                    m.tool_call_id,
+                    m.name,
+                    chars_saved,
+                )
+                new_kwargs = dict(kwargs)
+                append_tool_transform(new_kwargs, "pruned", by="DeerFlowSummarizationMiddleware")
+                result.append(
+                    m.model_copy(
+                        update={
+                            "content": pruned_content,
+                            "additional_kwargs": new_kwargs,
+                        }
+                    )
+                )
+            else:
+                result.append(m)
+        return result
 
     def _fire_hooks(
         self,
@@ -1370,6 +1560,9 @@ def create_summarization_middleware(
         "keep": keep_tuple,
         "trim_tokens_to_summarize": config.trim_tokens_to_summarize,
         "summary_prompt": _DEERFLOW_SUMMARY_PROMPT if config.summary_prompt is None else config.summary_prompt,
+        "prune_tool_outputs": config.prune_tool_outputs,
+        "max_tool_output_chars": config.max_tool_output_chars,
+        "keep_recent_tool_turns": config.keep_recent_tool_turns,
     }
 
     hooks: list[BeforeSummarizationHook] = []

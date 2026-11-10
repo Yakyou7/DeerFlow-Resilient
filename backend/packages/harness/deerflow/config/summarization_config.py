@@ -97,6 +97,26 @@ class SummarizationConfig(BaseModel):
         default=None,
         description="Custom prompt template for generating summaries. Null selects DeerFlow's built-in prompt.",
     )
+    prune_tool_outputs: bool = Field(
+        default=False,
+        description="Whether to fold older externalized ToolMessage previews in preserved history to compact file-reference pointers during compaction.",
+    )
+    max_tool_output_chars: int = Field(
+        default=300,
+        ge=50,
+        description="Maximum un-folded character length for older externalized ToolMessages in preserved history; previews above this length fold to their externalized file-reference pointer.",
+    )
+    keep_recent_tool_turns: int = Field(
+        default=2,
+        ge=0,
+        description="Number of most recent tool turns whose outputs are preserved intact.",
+    )
+
+    @field_validator("max_tool_output_chars", "keep_recent_tool_turns", mode="before")
+    @classmethod
+    def _reject_boolean_pruning_ints(cls, value: object, info: ValidationInfo) -> object:
+        return reject_boolean(value, info, kind="an integer")
+
     skill_file_read_tool_names: list[str] = Field(
         default_factory=lambda: list(DEFAULT_SKILL_FILE_READ_TOOL_NAMES),
         description="Tool names treated as skill-file reads when capturing loaded skills into the durable skill_context channel.",
