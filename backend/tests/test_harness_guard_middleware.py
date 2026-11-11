@@ -9,11 +9,14 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from deerflow.agents.middlewares.harness_guard_middleware import (
     HARNESS_GUARD_KEY,
+    HARNESS_GUARD_WITHHELD_PLACEHOLDER,
     HarnessGuardMiddleware,
     classify_tool_error,
+    sanitize_tool_payload,
     verify_content_syntax,
 )
 from deerflow.agents.middlewares.tool_result_meta import TOOL_META_KEY
+from deerflow.agents.middlewares.tool_transform_meta import TOOL_TRANSFORMS_KEY, read_tool_transforms
 from deerflow.config.harness_guard_config import HarnessGuardConfig
 
 
@@ -725,3 +728,215 @@ class TestAlternatingLoopGraph:
         assert failed.additional_kwargs[TOOL_META_KEY]["status"] == "error"
         assert "OSCILLATION DETECTED" in failed.content
         assert failed.additional_kwargs[HARNESS_GUARD_KEY]["oscillation_warning"] is True
+
+
+class TestReplayValidPayloadSanitization:
+    def test_sanitize_tool_payload_direct_structure_preservation(self):
+        msg = ToolMessage(
+            content="Original massive sensitive secret log output",
+            tool_call_id="call-42",
+            name="query_secrets",
+            status="error",
+            artifact={"raw_dump": "sensitive"},
+        )
+        sanitized = sanitize_tool_payload(
+            msg,
+            reason="oversized_payload",
+            original_length=len(msg.content),
+            diagnostic_hints=["[HARNESS GUARD] Check your query filter."],
+        )
+
+        assert sanitized is msg  # in-place mutation
+        assert sanitized.tool_call_id == "call-42"
+        assert sanitized.name == "query_secrets"
+        assert sanitized.status == "error"
+        assert sanitized.artifact is None
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in sanitized.content
+        assert "[HARNESS GUARD: PAYLOAD WITHHELD]" in sanitized.content
+        assert "[HARNESS GUARD] Check your query filter." in sanitized.content
+        assert "Original massive sensitive" not in sanitized.content
+
+        # Metadata checks
+        guard_data = sanitized.additional_kwargs[HARNESS_GUARD_KEY]
+        assert guard_data["sanitized"] is True
+        assert guard_data["sanitization_reason"] == "oversized_payload"
+        assert guard_data["original_length"] == len("Original massive sensitive secret log output")
+
+        tool_meta = sanitized.additional_kwargs[TOOL_META_KEY]
+        assert tool_meta["status"] == "error"
+        assert tool_meta["error_type"] == "payload_withheld"
+        assert tool_meta["recoverable_by_model"] is True
+
+        transforms = read_tool_transforms(sanitized)
+        assert any(t["kind"] == "sanitized" for t in transforms)
+
+    def test_wrap_tool_call_oversized_payload(self):
+        config = HarnessGuardConfig(max_payload_length=500)
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("bash", {"command": "cat /var/log/syslog"}, tool_call_id="call-syslog-1")
+
+        huge_payload = "A" * 2000
+        res = middleware.wrap_tool_call(
+            req,
+            lambda r: ToolMessage(content=huge_payload, tool_call_id=r.tool_call["id"], name="bash", status="success"),
+        )
+
+        assert res.tool_call_id == "call-syslog-1"
+        assert res.name == "bash"
+        assert res.status == "error"
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in res.content
+        assert "2000 chars" in res.content
+        assert "A" * 2000 not in res.content
+        assert res.additional_kwargs[HARNESS_GUARD_KEY]["sanitized"] is True
+        assert res.additional_kwargs[HARNESS_GUARD_KEY]["sanitization_reason"] == "oversized_payload"
+
+    def test_null_bytes_sanitization(self):
+        config = HarnessGuardConfig()
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("read_binary", {"path": "corrupt.bin"}, tool_call_id="call-bin-1")
+
+        binary_content = "header\x00corrupt\x00nullbytes\x00footer"
+        res = middleware.wrap_tool_call(
+            req,
+            lambda r: ToolMessage(content=binary_content, tool_call_id=r.tool_call["id"], name="read_binary"),
+        )
+
+        assert res.tool_call_id == "call-bin-1"
+        assert res.status == "error"
+        assert "\x00" not in res.content
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in res.content
+        assert "null bytes" in res.content
+        assert res.additional_kwargs[HARNESS_GUARD_KEY]["sanitization_reason"] == "null_bytes"
+
+    def test_blocked_by_guard_flag_sanitization(self):
+        config = HarnessGuardConfig()
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("restricted_tool", {}, tool_call_id="call-sec-1")
+
+        res = middleware.wrap_tool_call(
+            req,
+            lambda r: ToolMessage(
+                content="Unauthorized access to system keyring",
+                tool_call_id=r.tool_call["id"],
+                name="restricted_tool",
+                status="error",
+                additional_kwargs={HARNESS_GUARD_KEY: {"blocked": True}},
+            ),
+        )
+
+        assert res.tool_call_id == "call-sec-1"
+        assert res.status == "error"
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in res.content
+        assert "safety guardrail" in res.content
+        assert "Unauthorized access" not in res.content
+
+    def test_critical_repetition_payload_withheld_when_enabled(self):
+        config = HarnessGuardConfig(
+            max_repeated_error_signatures=2,
+            sanitize_on_critical_repetition=True,
+        )
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("bash", {"command": "npm install"})
+        raw_err = "FileNotFoundError: [Errno 2] No such file or directory: 'package.json'\n" + "stacktrace line\n" * 50
+
+        # Turn 1: regular failure with targeted hint injected
+        res1 = middleware.wrap_tool_call(
+            req,
+            lambda r: ToolMessage(content=raw_err, tool_call_id=r.tool_call["id"], name="bash", status="error"),
+        )
+        assert res1.additional_kwargs.get(HARNESS_GUARD_KEY, {}).get("sanitized") is None
+        assert "FileNotFoundError" in res1.content
+
+        # Turn 2: triggers critical repetition -> raw error body withheld
+        res2 = middleware.wrap_tool_call(
+            req,
+            lambda r: ToolMessage(content=raw_err, tool_call_id=r.tool_call["id"], name="bash", status="error"),
+        )
+        assert res2.tool_call_id == req.tool_call["id"]
+        assert res2.status == "error"
+        assert res2.additional_kwargs[HARNESS_GUARD_KEY]["sanitized"] is True
+        assert res2.additional_kwargs[HARNESS_GUARD_KEY]["sanitization_reason"] == "critical_repetition"
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in res2.content
+        assert "CRITICAL REPETITION" in res2.content
+        assert "stacktrace line" not in res2.content
+
+    def test_multimodal_list_content_sanitization(self):
+        config = HarnessGuardConfig(max_payload_length=100)
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("image_describe", {}, tool_call_id="call-mm-1")
+
+        blocks = [{"type": "text", "text": "X" * 500}]
+        res = middleware.wrap_tool_call(
+            req,
+            lambda r: ToolMessage(content=blocks, tool_call_id=r.tool_call["id"], name="image_describe"),
+        )
+
+        assert res.tool_call_id == "call-mm-1"
+        assert isinstance(res.content, list)
+        assert len(res.content) == 1
+        assert res.content[0]["type"] == "text"
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in res.content[0]["text"]
+        assert "X" * 500 not in res.content[0]["text"]
+
+    def test_command_wrapper_sanitization(self):
+        from langgraph.types import Command
+
+        config = HarnessGuardConfig(max_payload_length=100)
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("cmd_tool", {}, tool_call_id="call-cmd-1")
+
+        inner_msg = ToolMessage(content="Y" * 200, tool_call_id="call-cmd-1", name="cmd_tool")
+        cmd = Command(update={"messages": [inner_msg]})
+
+        res = middleware.wrap_tool_call(req, lambda r: cmd)
+        assert isinstance(res, Command)
+        assert inner_msg.tool_call_id == "call-cmd-1"
+        assert inner_msg.status == "error"
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in inner_msg.content
+        assert "Y" * 200 not in inner_msg.content
+
+    @pytest.mark.asyncio
+    async def test_awrap_tool_call_sanitization(self):
+        config = HarnessGuardConfig(max_payload_length=100)
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("async_tool", {}, tool_call_id="call-async-1")
+
+        async def dummy_async_handler(r):
+            return ToolMessage(content="Z" * 150, tool_call_id=r.tool_call["id"], name="async_tool")
+
+        res = await middleware.awrap_tool_call(req, dummy_async_handler)
+        assert res.tool_call_id == "call-async-1"
+        assert res.status == "error"
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in res.content
+        assert "Z" * 150 not in res.content
+
+    def test_replay_valid_pairing_with_assistant_message(self):
+        """Simulate an OpenAI API message exchange: AIMessage(tool_calls) + ToolMessage(tool_call_id)."""
+        from langchain_core.messages import AIMessage
+
+        config = HarnessGuardConfig(max_payload_length=100)
+        middleware = HarnessGuardMiddleware(config)
+        req = _make_request("run_query", {"q": "SELECT * FROM huge_table"}, tool_call_id="call_openai_999")
+
+        # AIMessage that initiated the call
+        ai_msg = AIMessage(
+            content="I will run the query now.",
+            tool_calls=[{"name": "run_query", "args": {"q": "SELECT * FROM huge_table"}, "id": "call_openai_999", "type": "tool_call"}],
+        )
+
+        res = middleware.wrap_tool_call(
+            req,
+            lambda r: ToolMessage(content="ROW_DATA," * 1000, tool_call_id=r.tool_call["id"], name="run_query"),
+        )
+
+        # In strict OpenAI replay:
+        # 1. tool_call_id matches the AIMessage's tool_call['id'] exactly
+        assert res.tool_call_id == ai_msg.tool_calls[0]["id"]
+        # 2. content is a valid non-empty string, no null bytes
+        assert isinstance(res.content, str) and len(res.content) > 0
+        assert "\x00" not in res.content
+        # 3. status is error and payload is safely withheld
+        assert res.status == "error"
+        assert HARNESS_GUARD_WITHHELD_PLACEHOLDER in res.content
+        assert "ROW_DATA," not in res.content
+

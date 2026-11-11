@@ -716,6 +716,14 @@ def _task_result_command(
         # RFC #4651 PR4: the rendered checklist rides the model-visible result
         # text; metadata carries the structured verdict for the ledger/judge.
         content = f"{content}\n\n{render_acceptance_section(acceptance_verdict)}"
+
+    # RFC-003: Typed Subagent Handoff Protocol
+    from deerflow.subagents.typed_handoff import parse_typed_handoff, render_handoff_section
+
+    handoff = parse_typed_handoff(result or error or "", status=status, tool_receipts=tool_receipts)
+    if "<handoff>" in (result or "").lower():
+        content = f"{content}\n\n{render_handoff_section(handoff)}"
+
     artifact = cited_source_artifact(source_messages or [], content, include_omissions=True)
     if knowledge_sources:
         from deerflow.knowledge.sources import forward_sources
@@ -745,6 +753,7 @@ def _task_result_command(
                         tool_receipts=tool_receipts,
                         receipt_verdict=receipt_verdict,
                         acceptance_verdict=acceptance_verdict,
+                        handoff=handoff.model_dump(),
                     ),
                 )
             ]
@@ -918,7 +927,15 @@ async def task_tool(
         )
     # Rejected delegations must not serialize the retained history. Capture
     # after delegation validation, before child setup (including tool loading).
-    context_snapshot = ParentContextSnapshot.from_state(runtime.state) if context_mode == "snapshot" and runtime is not None else None
+    if context_mode == "snapshot" and runtime is not None:
+        if bool(getattr(config, "nest_history", False)):
+            from deerflow.subagents.typed_handoff import remove_all_tools
+
+            context_snapshot = ParentContextSnapshot.from_state(runtime.state, input_filter=remove_all_tools, nest_history=True)
+        else:
+            context_snapshot = ParentContextSnapshot.from_state(runtime.state)
+    else:
+        context_snapshot = None
 
     # Build config overrides
     overrides: dict = {}

@@ -44,3 +44,20 @@ class HarnessGuardConfig(BaseModel):
         ge=10,
         description="Maximum number of tracked thread/run scopes retained in the bounded LRU history cache",
     )
+    sanitize_payload_enabled: bool = Field(
+        default=True,
+        description="Whether to enable Replay-Valid payload sanitization for oversized, illegal, or blocked tool outputs",
+    )
+    max_payload_length: int = Field(
+        default=100000,
+        ge=100,
+        description="Maximum character length of tool output before Replay-Valid sanitization withholds payload",
+    )
+    withheld_placeholder: str = Field(
+        default="Output withheld by HarnessGuard.",
+        description="Safe placeholder text injected when tool output payload is sanitized",
+    )
+    sanitize_on_critical_repetition: bool = Field(
+        default=False,
+        description="Whether to withhold the raw error body when critical repetition is triggered to break token repetition",
+    )

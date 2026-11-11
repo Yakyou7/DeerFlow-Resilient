@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -95,7 +95,13 @@ class ParentContextSnapshot:
     content_json: str
 
     @classmethod
-    def from_state(cls, state: Mapping[str, Any]) -> ParentContextSnapshot | None:
+    def from_state(
+        cls,
+        state: Mapping[str, Any],
+        *,
+        input_filter: Callable[[list[Any]], list[Any]] | None = None,
+        nest_history: bool = False,
+    ) -> ParentContextSnapshot | None:
         """Capture only retained messages and summary, before dispatch yields.
 
         A single background HumanMessage avoids replaying parent tool protocol
@@ -115,6 +121,18 @@ class ParentContextSnapshot:
         if isinstance(summary, str) and summary.strip():
             add_text(f"Historical conversation summary:\n{summary}")
         messages = convert_to_messages(state.get("messages") or [])
+        if input_filter is not None:
+            messages = input_filter(messages)
+
+        if nest_history:
+            from deerflow.subagents.typed_handoff import nest_handoff_history
+
+            history_text = nest_handoff_history(messages, filter_tools=True)
+            add_text(history_text)
+            if not blocks:
+                return None
+            return cls(content_json=json.dumps(blocks, ensure_ascii=False))
+
         retained_positions = {index for index, message in enumerate(messages) if _is_conversation_message(message)}
         # Providers may reuse call ids across turns. Match each result to the
         # preceding call, including hidden frames so their results cannot be

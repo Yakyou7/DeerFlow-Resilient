@@ -40,6 +40,7 @@ from deerflow.sandbox.tools import _match_line_endings, read_current_file_conten
 logger = logging.getLogger(__name__)
 
 HARNESS_GUARD_KEY = "deerflow_harness_guard"
+HARNESS_GUARD_WITHHELD_PLACEHOLDER = "Output withheld by HarnessGuard."
 _WRITE_TOOLS = frozenset({"str_replace"})
 
 type _ScopeKey = tuple[str, str | None]
@@ -207,6 +208,100 @@ class _ToolRecord:
     error_signature: str | None
 
 
+def sanitize_tool_payload(
+    message: ToolMessage,
+    *,
+    reason: str,
+    placeholder: str = HARNESS_GUARD_WITHHELD_PLACEHOLDER,
+    diagnostic_hints: list[str] | None = None,
+    original_length: int | None = None,
+    tool_call_id: str | None = None,
+    tool_name: str | None = None,
+) -> ToolMessage:
+    """Sanitize a ToolMessage payload in-place in a Replay-Valid manner.
+
+    Preserves:
+    - tool_call_id (essential for provider message pairing to prevent OpenAI 400 errors)
+    - name (tool name)
+    - status ('error' to indicate non-execution / withholding)
+    - additional_kwargs (keeps metadata envelope, records audit trail)
+
+    Replaces:
+    - content -> harmless placeholder + explanation + optional diagnostic hints
+    - artifact -> None (prevents leaking large/sensitive payload through artifact field)
+    """
+    if tool_call_id:
+        message.tool_call_id = str(tool_call_id)
+    elif not getattr(message, "tool_call_id", None):
+        message.tool_call_id = "missing-id"
+
+    if tool_name:
+        message.name = str(tool_name)
+    elif not getattr(message, "name", None):
+        message.name = "unknown"
+
+    message.status = "error"
+    message.artifact = None
+
+    placeholder_text = placeholder or HARNESS_GUARD_WITHHELD_PLACEHOLDER
+    if reason == "oversized_payload":
+        detail = (
+            f"[HARNESS GUARD: PAYLOAD WITHHELD] Output exceeded maximum allowed length "
+            f"({original_length} chars). Original output withheld to prevent context overflow "
+            f"and maintain replay validity."
+        )
+    elif reason == "null_bytes":
+        detail = (
+            "[HARNESS GUARD: PAYLOAD WITHHELD] Output contained invalid null bytes (\\x00). "
+            "Original output withheld to prevent provider API 400 protocol rejection."
+        )
+    elif reason in {"blocked", "blocked_by_guard", "security_violation"}:
+        detail = "[HARNESS GUARD: PAYLOAD WITHHELD] Tool output was withheld by safety guardrail."
+    elif reason == "critical_repetition":
+        detail = "[HARNESS GUARD: PAYLOAD WITHHELD] Repeated failure body withheld to break token repetition loop."
+    else:
+        detail = f"[HARNESS GUARD: PAYLOAD WITHHELD] Output withheld ({reason})."
+
+    content_parts = [placeholder_text, detail]
+    if diagnostic_hints:
+        content_parts.extend(diagnostic_hints)
+
+    final_text = "\n\n".join(content_parts)
+    if isinstance(message.content, list):
+        message.content = [{"type": "text", "text": final_text}]
+    else:
+        message.content = final_text
+
+    if not isinstance(message.additional_kwargs, dict):
+        message.additional_kwargs = {}
+
+    append_tool_transform(message.additional_kwargs, "sanitized", by="HarnessGuardMiddleware", version="1")
+    if HARNESS_GUARD_KEY not in message.additional_kwargs:
+        message.additional_kwargs[HARNESS_GUARD_KEY] = {}
+    message.additional_kwargs[HARNESS_GUARD_KEY].update(
+        {
+            "sanitized": True,
+            "sanitization_reason": reason,
+            "original_length": original_length if original_length is not None else len(final_text),
+            "placeholder": placeholder_text,
+        }
+    )
+
+    if TOOL_META_KEY not in message.additional_kwargs or not isinstance(message.additional_kwargs[TOOL_META_KEY], dict):
+        message.additional_kwargs[TOOL_META_KEY] = {}
+    message.additional_kwargs[TOOL_META_KEY].update(
+        {
+            "status": "error",
+            "error_type": "payload_withheld",
+            "recoverable_by_model": True,
+            "recommended_next_action": "try_alternative",
+            "source": "harness_guard",
+        }
+    )
+
+    return message
+
+
 class HarnessGuardMiddleware(AgentMiddleware):
     """Tool-loop interceptor for write syntax verification, error hints, and anti-doom-loop."""
 
@@ -320,9 +415,34 @@ class HarnessGuardMiddleware(AgentMiddleware):
                     },
                 },
             )
+            if self.config.sanitize_payload_enabled and len(msg.content) > self.config.max_payload_length:
+                sanitize_tool_payload(
+                    msg,
+                    reason="oversized_payload",
+                    placeholder=self.config.withheld_placeholder,
+                    original_length=len(msg.content),
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                )
             return normalize_tool_result(msg)
 
         return None
+
+    def sanitize_payload(
+        self,
+        message: ToolMessage,
+        *,
+        reason: str = "blocked",
+        placeholder: str | None = None,
+        diagnostic_hints: list[str] | None = None,
+    ) -> ToolMessage:
+        """Sanitize a ToolMessage in a Replay-Valid manner using middleware configuration."""
+        return sanitize_tool_payload(
+            message,
+            reason=reason,
+            placeholder=placeholder or self.config.withheld_placeholder,
+            diagnostic_hints=diagnostic_hints,
+        )
 
     def _post_process_tool_message(
         self,
@@ -331,6 +451,12 @@ class HarnessGuardMiddleware(AgentMiddleware):
     ) -> ToolMessage:
         """Analyze tool result, classify error signatures, inject hints, and detect loops."""
         tool_name = str(request.tool_call.get("name") or result.name or "unknown")
+        req_tool_id = request.tool_call.get("id")
+        if not getattr(result, "tool_call_id", None) and req_tool_id:
+            result.tool_call_id = str(req_tool_id)
+        if not getattr(result, "name", None) and tool_name:
+            result.name = tool_name
+
         raw_text = _extract_text_content(result.content)
         tool_meta = result.additional_kwargs.get(TOOL_META_KEY) if hasattr(result, "additional_kwargs") and isinstance(result.additional_kwargs, dict) else None
         is_error = getattr(result, "status", "success") == "error" or (isinstance(tool_meta, dict) and tool_meta.get("status") == "error")
@@ -381,6 +507,35 @@ class HarnessGuardMiddleware(AgentMiddleware):
             injected_parts.append(repetition_warning)
         if oscillation_warning:
             injected_parts.append(oscillation_warning)
+
+        # Replay-Valid Payload Sanitization Check
+        sanitize_reason: str | None = None
+        if self.config.sanitize_payload_enabled:
+            guard_meta = result.additional_kwargs.get(HARNESS_GUARD_KEY) if isinstance(result.additional_kwargs, dict) else None
+            is_blocked = (
+                (isinstance(guard_meta, dict) and bool(guard_meta.get("blocked")))
+                or (isinstance(result.additional_kwargs, dict) and bool(result.additional_kwargs.get("blocked")))
+            )
+            if "\x00" in raw_text:
+                sanitize_reason = "null_bytes"
+            elif len(raw_text) > self.config.max_payload_length:
+                sanitize_reason = "oversized_payload"
+            elif is_blocked:
+                sanitize_reason = "blocked"
+            elif repetition_warning and self.config.sanitize_on_critical_repetition:
+                sanitize_reason = "critical_repetition"
+
+        if sanitize_reason is not None:
+            sanitize_tool_payload(
+                result,
+                reason=sanitize_reason,
+                placeholder=self.config.withheld_placeholder,
+                diagnostic_hints=injected_parts,
+                original_length=len(raw_text),
+                tool_call_id=str(req_tool_id or getattr(result, "tool_call_id", None) or ""),
+                tool_name=tool_name,
+            )
+            return result
 
         if injected_parts:
             hint_block_text = "\n\n" + "\n".join(injected_parts)
