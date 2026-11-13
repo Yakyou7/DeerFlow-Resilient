@@ -485,3 +485,168 @@ def test_bitemporal_point_in_time_query(temp_aimem):
     # Point in time query: before 2026-01-01 (no facts existed)
     ancient_view = manager.get_memory(user_id="u_time", as_of="2025-12-31T00:00:00Z")["facts"]
     assert len(ancient_view) == 0
+
+
+def test_symmetric_scope_enforcement_search_and_get_by_id(temp_aimem, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from deerflow.agents.memory import tools as memory_tools
+
+    manager, _ = temp_aimem
+
+    # 1. Agent-private fact: visible only to owner agent, blocked symmetrically in search + get_by_id
+    _, priv_id = manager.create_fact(
+        "Secret research hypothesis alpha",
+        category="entity",
+        user_id="u_scope",
+        agent_name="research",
+    )
+    assert priv_id is not None
+    assert manager.get_by_id(priv_id, user_id="u_scope", agent_name="research") is not None
+    assert len(manager.search("hypothesis", user_id="u_scope", agent_name="research")) == 1
+
+    # Unauthorized callers (other agent, default unscoped, or other user) must see neither search nor get_by_id
+    for bad_user, bad_agent in [("u_scope", "other-agent"), ("u_scope", None), ("u_other", "research")]:
+        assert manager.get_by_id(priv_id, user_id=bad_user, agent_name=bad_agent) is None
+        assert manager.search("hypothesis", user_id=bad_user, agent_name=bad_agent) == []
+
+    # Fallback LIKE search must also enforce the exact same boundary
+    manager._config.enable_fts = False
+    assert manager.search("hypothesis", user_id="u_scope", agent_name="other-agent") == []
+    assert len(manager.search("hypothesis", user_id="u_scope", agent_name="research")) == 1
+    manager._config.enable_fts = True
+
+    # 2. Named RBAC scope_role: blocked without matching role on both search and get_by_id
+    _, sec_id = manager.create_fact(
+        "Credential rotation policy token_v2",
+        category="archive",
+        user_id="u_scope",
+        agent_name="sec_writer",
+        scope_role="security",
+        writer_id="sec_writer",
+    )
+    assert sec_id is not None
+    assert manager.get_by_id(sec_id, user_id="u_scope", agent_name="auditor", scope_role="viewer") is None
+    assert manager.search("rotation", user_id="u_scope", agent_name="auditor", scope_role="viewer") == []
+    assert manager.get_by_id(sec_id, user_id="u_scope", agent_name="auditor") is None
+
+    allowed_fact = manager.get_by_id(sec_id, user_id="u_scope", agent_name="auditor", scope_role="security")
+    assert allowed_fact is not None
+    assert allowed_fact["writer_id"] == "sec_writer"
+    assert len(manager.search("rotation", user_id="u_scope", agent_name="auditor", caller_roles=["security"])) == 1
+
+    # 3. Fleet-shared fact within user_id: readable by peer agents, isolated from other tenants
+    _, shared_id = manager.create_fact(
+        "Shared architecture uses SQLite WAL",
+        category="entity",
+        user_id="u_scope",
+        agent_name="architect",
+        scope_role="shared",
+    )
+    assert shared_id is not None
+    assert manager.get_by_id(shared_id, user_id="u_scope", agent_name="coder") is not None
+    assert len(manager.search("SQLite WAL", user_id="u_scope", agent_name="coder")) == 1
+    assert manager.get_by_id(shared_id, user_id="u_other", agent_name="coder") is None
+
+    # 4. Tool boundary parity via memory_get_tool
+    monkeypatch.setattr(memory_tools, "get_memory_manager", lambda: manager)
+    ok_res = json.loads(memory_tools.memory_get_tool.func(SimpleNamespace(context={"user_id": "u_scope", "agent_name": "research"}), priv_id))
+    assert ok_res["fact"]["id"] == priv_id
+    idor_res = json.loads(memory_tools.memory_get_tool.func(SimpleNamespace(context={"user_id": "u_scope", "agent_name": "other-agent"}), priv_id))
+    assert idor_res == {"error": f"Fact not found: {priv_id}"}
+
+
+def test_cross_scope_fact_id_collision_isolation(temp_aimem):
+    manager, _ = temp_aimem
+
+    # Same fact_id across two agents under same user AND across two users
+    f_a = MemoryFact(id="collide_01", content="Agent Alpha private secret", category="profile", agent_name="alpha", scope_role="private")
+    f_b = MemoryFact(id="collide_01", content="Agent Beta private secret", category="profile", agent_name="beta", scope_role="private")
+    f_u2 = MemoryFact(id="collide_01", content="Tenant Two private secret", category="profile", agent_name="alpha", scope_role="private")
+
+    manager._storage.upsert_fact("u_col1", f_a)
+    manager._indexer.upsert_fact("u_col1", f_a)
+    manager._storage.upsert_fact("u_col1", f_b)
+    manager._indexer.upsert_fact("u_col1", f_b)
+    manager._storage.upsert_fact("u_col2", f_u2)
+    manager._indexer.upsert_fact("u_col2", f_u2)
+
+    # Deleting collide_01 for alpha in u_col1 must NOT affect beta or u_col2
+    manager.delete_fact("collide_01", user_id="u_col1", agent_name="alpha")
+
+    assert manager.get_by_id("collide_01", user_id="u_col1", agent_name="alpha") is None
+    assert manager.search("Alpha private", user_id="u_col1", agent_name="alpha") == []
+
+    beta_fact = manager.get_by_id("collide_01", user_id="u_col1", agent_name="beta")
+    assert beta_fact is not None and "Beta" in beta_fact["content"]
+    assert len(manager.search("Beta private", user_id="u_col1", agent_name="beta")) == 1
+
+    u2_fact = manager.get_by_id("collide_01", user_id="u_col2", agent_name="alpha")
+    assert u2_fact is not None and "Tenant Two" in u2_fact["content"]
+
+
+def test_pipeline_ordering_supersession_before_dedup(temp_aimem):
+    manager, _ = temp_aimem
+
+    # 1. High-overlap superseding statements (>75% token overlap) must NOT be swallowed by near-dup gate
+    _, id_mysql = manager.create_fact("Primary database is MySQL", category="entity", user_id="u_pipe")
+    _, id_pg = manager.create_fact("Primary database is PostgreSQL", category="entity", user_id="u_pipe")
+    assert id_mysql is not None and id_pg is not None
+
+    active = manager.get_memory(user_id="u_pipe")["facts"]
+    assert len(active) == 1
+    assert active[0]["content"] == "Primary database is PostgreSQL"
+    assert active[0]["supersedes_id"] == id_mysql
+
+    history = manager.get_memory(user_id="u_pipe", include_invalidated=True)["facts"]
+    assert len(history) == 2
+    old_mysql = next(f for f in history if f["id"] == id_mysql)
+    assert old_mysql["invalidated_at"] != ""
+    assert manager.search("MySQL", user_id="u_pipe") == []
+
+    # 2. update_fact with the same fact_id preserves bi-temporal invalidated history while keeping active id
+    manager.update_fact(id_pg, content="Primary database is CockroachDB", user_id="u_pipe")
+    active_after_update = manager.get_memory(user_id="u_pipe")["facts"]
+    assert len(active_after_update) == 1
+    assert active_after_update[0]["id"] == id_pg
+    assert active_after_update[0]["content"] == "Primary database is CockroachDB"
+    assert len(manager.get_memory(user_id="u_pipe", include_invalidated=True)["facts"]) == 3
+
+    # 3. Non-contradictory punctuation/case near-duplicate IS compacted in Stage 2
+    manager.create_fact("Team meets every Monday morning at ten", category="profile", user_id="u_pipe")
+    manager.create_fact("Team meets every Monday morning at ten.", category="profile", user_id="u_pipe")
+    profile_facts = [f for f in manager.get_memory(user_id="u_pipe")["facts"] if f["category"] == "profile"]
+    assert len(profile_facts) == 1
+
+
+def test_provenance_chain_roundtrip_and_sleep_compute_scope(temp_aimem):
+    manager, _ = temp_aimem
+    manager._config.sleep_idle_debounce_seconds = 60.0
+
+    # Sleep-time trace preserves agent_name, writer_id, scope_role, and parent_provenance_ids
+    manager.add(
+        "thread_gov",
+        [HumanMessage(content="Please remember that my favorite language is Rust")],
+        user_id="u_prov",
+        agent_name="planner",
+        scope_role="shared",
+        writer_id="planner-worker-1",
+        parent_provenance_ids=["ev_101", "ev_102"],
+    )
+    stats = manager.sleep_time_compute(user_id="u_prov")
+    assert stats["crystallized_facts"] == 1
+
+    # Reload from Markdown on disk and verify full governance metadata roundtrip
+    reloaded = manager.reload_memory(user_id="u_prov")
+    assert len(reloaded["facts"]) == 1
+    fact = reloaded["facts"][0]
+    assert fact["agent_name"] == "planner"
+    assert fact["scope_role"] == "shared"
+    assert fact["writer_id"] == "planner-worker-1"
+    assert fact["parent_provenance_ids"] == ["ev_101", "ev_102"]
+
+    search_hits = manager.search("Rust", user_id="u_prov", agent_name="coder")
+    assert len(search_hits) == 1
+    assert search_hits[0]["writer_id"] == "planner-worker-1"
+    assert search_hits[0]["parent_provenance_ids"] == ["ev_101", "ev_102"]

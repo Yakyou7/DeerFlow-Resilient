@@ -6,13 +6,14 @@ and local SQLite FTS5 with BM25 + Recency Decay hybrid retrieval.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import datetime
 import html
 import logging
 import re
 import threading
 import time
+from collections.abc import Collection
+from dataclasses import dataclass
 from typing import Any, ClassVar, Literal
 
 from pydantic import PrivateAttr
@@ -22,7 +23,12 @@ from deerflow.agents.memory.manager import MemoryManager
 
 from .config import AimemConfig
 from .indexer import FtsIndexer
-from .storage import MarkdownStorage, MemoryFact
+from .storage import (
+    MarkdownStorage,
+    MemoryFact,
+    _normalize_agent_name,
+    resolve_default_scope_role,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,9 @@ class _RawTrace:
     agent_name: str | None = None
     trace_id: str | None = None
     timestamp: float = 0.0
+    scope_role: str | None = None
+    writer_id: str | None = None
+    parent_provenance_ids: list[str] | None = None
 
 
 class AimemMemoryManager(MemoryManager):
@@ -92,13 +101,43 @@ class AimemMemoryManager(MemoryManager):
 
     # ── Write Operations (Tier 1) ──────────────────────────────────────────
 
-    def _extract_and_persist(self, uid: str, messages: list[Any]) -> tuple[int, int]:
+    def _persist_fact(self, uid: str, fact: MemoryFact) -> tuple[MemoryFact, list[str]]:
+        """Persist a single fact through Stage-1 supersession -> Stage-2 dedup and sync FTS5."""
+        saved_fact, superseded_ids = self._storage.upsert_fact_governed(uid, fact)
+        for sup_id in superseded_ids:
+            self._indexer.invalidate_fact(
+                sup_id,
+                invalidated_at=saved_fact.valid_from,
+                user_id=uid,
+                agent_name=saved_fact.agent_name,
+                scope_role=saved_fact.scope_role,
+            )
+            logger.info("Aimem invalidated outdated fact: [%s]", sup_id)
+
+        self._indexer.upsert_fact(uid, saved_fact)
+        return saved_fact, superseded_ids
+
+    def _extract_and_persist(
+        self,
+        uid: str,
+        messages: list[Any],
+        *,
+        agent_name: str | None = None,
+        scope_role: str | None = None,
+        writer_id: str | None = None,
+        parent_provenance_ids: list[str] | None = None,
+    ) -> tuple[int, int]:
         """Synchronously extract preference/entity facts from messages and persist to Markdown & FTS.
 
         Returns (crystallized_count, superseded_count).
         """
         if not messages:
             return 0, 0
+
+        norm_agent = _normalize_agent_name(agent_name)
+        resolved_role = resolve_default_scope_role(norm_agent, scope_role)
+        resolved_writer = writer_id or norm_agent or "default"
+        parents = list(parent_provenance_ids or [])
 
         crystallized_count = 0
         superseded_count = 0
@@ -132,14 +171,13 @@ class AimemMemoryManager(MemoryManager):
                     content=matched_fact,
                     category=category,
                     confidence=1.0,
+                    agent_name=norm_agent,
+                    scope_role=resolved_role,
+                    writer_id=resolved_writer,
+                    parent_provenance_ids=list(parents),
                 )
-                saved_fact, superseded_id = self._storage.upsert_fact(uid, fact)
-                if superseded_id:
-                    self._indexer.invalidate_fact(superseded_id, invalidated_at=saved_fact.valid_from)
-                    superseded_count += 1
-                    logger.info("Aimem invalidated outdated fact: [%s]", superseded_id)
-
-                self._indexer.upsert_fact(uid, saved_fact)
+                saved_fact, superseded_ids = self._persist_fact(uid, fact)
+                superseded_count += len(superseded_ids)
                 crystallized_count += 1
                 logger.info("Aimem stored fact: [%s] (%s) %s", saved_fact.id, saved_fact.category, saved_fact.content)
 
@@ -153,6 +191,9 @@ class AimemMemoryManager(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
         trace_id: str | None = None,
+        scope_role: str | None = None,
+        writer_id: str | None = None,
+        parent_provenance_ids: list[str] | None = None,
     ) -> None:
         """Extract and persist facts from conversation messages with sleep-time compute support."""
         uid = user_id or "default"
@@ -160,7 +201,14 @@ class AimemMemoryManager(MemoryManager):
             return
 
         if not self._config.sleep_time_compute_enabled:
-            self._extract_and_persist(uid, messages)
+            self._extract_and_persist(
+                uid,
+                messages,
+                agent_name=agent_name,
+                scope_role=scope_role,
+                writer_id=writer_id,
+                parent_provenance_ids=parent_provenance_ids,
+            )
             return
 
         trace = _RawTrace(
@@ -170,6 +218,9 @@ class AimemMemoryManager(MemoryManager):
             agent_name=agent_name,
             trace_id=trace_id,
             timestamp=time.time(),
+            scope_role=scope_role,
+            writer_id=writer_id,
+            parent_provenance_ids=list(parent_provenance_ids) if parent_provenance_ids else None,
         )
 
         with self._sleep_lock:
@@ -219,7 +270,14 @@ class AimemMemoryManager(MemoryManager):
         total_crystallized = 0
         total_superseded = 0
         for trace in traces:
-            c, s = self._extract_and_persist(trace.user_id, trace.messages)
+            c, s = self._extract_and_persist(
+                trace.user_id,
+                trace.messages,
+                agent_name=trace.agent_name,
+                scope_role=trace.scope_role,
+                writer_id=trace.writer_id,
+                parent_provenance_ids=trace.parent_provenance_ids,
+            )
             total_crystallized += c
             total_superseded += s
 
@@ -261,6 +319,8 @@ class AimemMemoryManager(MemoryManager):
         agent_name: str | None = None,
         thread_id: str | None = None,
         query: str | None = None,
+        scope_role: str | None = None,
+        caller_roles: Collection[str] | None = None,
     ) -> str:
         """Generate tiered context memory injection with budget allocation and recency decay."""
         uid = user_id or "default"
@@ -269,59 +329,55 @@ class AimemMemoryManager(MemoryManager):
         if max_facts <= 0:
             return ""
 
-        # Tiered budget allocation
         profile_budget = max(1, int(round(max_facts * self._config.profile_budget_ratio)))
         entity_budget = max(1, int(round(max_facts * self._config.entity_budget_ratio)))
         archive_budget = max(0, max_facts - profile_budget - entity_budget)
 
-        # 1. Profile facts (User habits & hard preferences)
-        profiles: list[dict[str, Any]] = []
-        if query and self._config.enable_fts:
-            profiles = self._indexer.search(query, top_k=profile_budget, user_id=uid, category="profile")
-        if len(profiles) < profile_budget:
-            all_profiles = self._storage.load_user_facts(uid, category="profile")
-            seen = {p["id"] for p in profiles}
-            for p in all_profiles:
-                if len(profiles) >= profile_budget:
-                    break
-                if p.id not in seen:
-                    profiles.append(p.to_dict())
-                    seen.add(p.id)
-
-        # 2. Entity & Project Knowledge facts
-        entities: list[dict[str, Any]] = []
-        if query and self._config.enable_fts:
-            entities = self._indexer.search(query, top_k=entity_budget, user_id=uid, category="entity")
-        if len(entities) < entity_budget:
-            all_entities = self._storage.load_user_facts(uid, category="entity")
-            seen = {e["id"] for e in entities}
-            for e in all_entities:
-                if len(entities) >= entity_budget:
-                    break
-                if e.id not in seen:
-                    entities.append(e.to_dict())
-                    seen.add(e.id)
-
-        # 3. Archive & Historical Decisions
-        archives: list[dict[str, Any]] = []
-        if archive_budget > 0:
+        def _collect_category(cat: str, budget: int) -> list[dict[str, Any]]:
+            if budget <= 0:
+                return []
+            items: list[dict[str, Any]] = []
             if query and self._config.enable_fts:
-                archives = self._indexer.search(query, top_k=archive_budget, user_id=uid, category="archive")
-            if len(archives) < archive_budget:
-                all_archives = self._storage.load_user_facts(uid, category="archive")
-                seen = {a["id"] for a in archives}
-                for a in all_archives:
-                    if len(archives) >= archive_budget:
+                items = self._indexer.search(
+                    query,
+                    top_k=budget,
+                    user_id=uid,
+                    agent_name=agent_name,
+                    scope_role=scope_role,
+                    caller_roles=caller_roles,
+                    category=cat,
+                )
+            if len(items) < budget:
+                all_cat = self._storage.load_user_facts(
+                    uid,
+                    category=cat,
+                    agent_name=agent_name,
+                    scope_role=scope_role,
+                    caller_roles=caller_roles,
+                )
+                seen = {item["id"] for item in items}
+                for f in all_cat:
+                    if len(items) >= budget:
                         break
-                    if a.id not in seen:
-                        archives.append(a.to_dict())
-                        seen.add(a.id)
+                    if f.id not in seen:
+                        items.append(f.to_dict())
+                        seen.add(f.id)
+            return items
 
-        # Touch accessed facts so their access count and last_accessed_at update
+        profiles = _collect_category("profile", profile_budget)
+        entities = _collect_category("entity", entity_budget)
+        archives = _collect_category("archive", archive_budget)
+
         accessed_ids = [f["id"] for f in [*profiles, *entities, *archives]]
         if accessed_ids:
-            self._storage.touch_facts(uid, accessed_ids)
-            self._indexer.touch_facts(accessed_ids)
+            self._storage.touch_facts(
+                uid,
+                accessed_ids,
+                agent_name=agent_name,
+                scope_role=scope_role,
+                caller_roles=caller_roles,
+            )
+            self._indexer.touch_facts(accessed_ids, user_id=uid, agent_name=agent_name)
 
         if not profiles and not entities and not archives:
             return ""
@@ -329,7 +385,6 @@ class AimemMemoryManager(MemoryManager):
         def _escape_context(val: str) -> str:
             return html.escape(str(val), quote=False)
 
-        # Format context injection block (outer <memory> tag is added by prompt builder)
         sections: list[str] = ["User Profile & Long-Term Context:"]
         for p in profiles:
             sections.append(f"- (profile) {_escape_context(p.get('content', ''))}")
@@ -350,23 +405,81 @@ class AimemMemoryManager(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
         category: str | None = None,
+        scope_role: str | None = None,
+        caller_roles: Collection[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Search memory facts using hybrid ranking (BM25 + recency decay + access frequency)."""
         uid = user_id or "default"
         self._ensure_crystallized(uid)
         if not self._config.enable_fts:
-            facts = self._storage.load_user_facts(uid, category=category)
+            facts = self._storage.load_user_facts(
+                uid,
+                category=category,
+                agent_name=agent_name,
+                scope_role=scope_role,
+                caller_roles=caller_roles,
+            )
             q = query.lower()
             matched = [f.to_dict() for f in facts if q in f.content.lower()]
             return matched[:top_k]
 
-        results = self._indexer.search(query, top_k=top_k, user_id=uid, category=category)
+        results = self._indexer.search(
+            query,
+            top_k=top_k,
+            user_id=uid,
+            agent_name=agent_name,
+            scope_role=scope_role,
+            caller_roles=caller_roles,
+            category=category,
+        )
         if results:
             retrieved_ids = [r["id"] for r in results]
-            self._storage.touch_facts(uid, retrieved_ids)
-            self._indexer.touch_facts(retrieved_ids)
+            self._storage.touch_facts(
+                uid,
+                retrieved_ids,
+                agent_name=agent_name,
+                scope_role=scope_role,
+                caller_roles=caller_roles,
+            )
+            self._indexer.touch_facts(retrieved_ids, user_id=uid, agent_name=agent_name)
 
         return results
+
+    def get_by_id(
+        self,
+        fact_id: str,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+        scope_role: str | None = None,
+        caller_roles: Collection[str] | None = None,
+        include_invalidated: bool = False,
+        as_of: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Direct point-lookup by ID enforcing the exact same scope authorization as search()."""
+        uid = user_id or "default"
+        self._ensure_crystallized(uid)
+        fact = self._storage.get_fact_by_id(
+            uid,
+            fact_id,
+            agent_name=agent_name,
+            scope_role=scope_role,
+            caller_roles=caller_roles,
+            include_invalidated=include_invalidated,
+            as_of=as_of,
+        )
+        if fact is None:
+            return None
+        if fact.is_active and not as_of:
+            self._storage.touch_facts(
+                uid,
+                [fact.id],
+                agent_name=agent_name,
+                scope_role=scope_role,
+                caller_roles=caller_roles,
+            )
+            self._indexer.touch_facts([fact.id], user_id=uid, agent_name=agent_name)
+        return fact.to_dict()
 
     # ── Management Operations (Tier 2) ─────────────────────────────────────
 
@@ -375,13 +488,22 @@ class AimemMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        scope_role: str | None = None,
+        caller_roles: Collection[str] | None = None,
         include_invalidated: bool = False,
         as_of: str | None = None,
     ) -> dict[str, Any]:
         """Return memory in DeerMem-compatible schema."""
         uid = user_id or "default"
         self._ensure_crystallized(uid)
-        facts = self._storage.load_user_facts(uid, include_invalidated=include_invalidated, as_of=as_of)
+        facts = self._storage.load_user_facts(
+            uid,
+            agent_name=agent_name,
+            scope_role=scope_role,
+            caller_roles=caller_roles,
+            include_invalidated=include_invalidated,
+            as_of=as_of,
+        )
         now = datetime.datetime.now(datetime.UTC).isoformat()
         return {
             "version": "1.0",
@@ -397,16 +519,48 @@ class AimemMemoryManager(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        """Clear memory for the user."""
+        """Clear memory for the user (or a specific agent bucket when agent_name is set)."""
         uid = user_id or "default"
+        norm_agent = _normalize_agent_name(agent_name)
         with self._sleep_lock:
-            self._pending_traces = [t for t in self._pending_traces if t.user_id != uid]
+            if agent_name is not None and norm_agent:
+                self._pending_traces = [
+                    t for t in self._pending_traces
+                    if not (t.user_id == uid and _normalize_agent_name(t.agent_name) == norm_agent)
+                ]
+            else:
+                self._pending_traces = [t for t in self._pending_traces if t.user_id != uid]
             if not self._pending_traces and self._sleep_timer is not None:
                 self._sleep_timer.cancel()
                 self._sleep_timer = None
-        self._storage.clear_user(uid)
-        self._indexer.sync_user_facts(uid, [])
+        self._storage.clear_user(uid, agent_name=agent_name)
+        self._indexer.sync_user_facts(uid, [], agent_name=agent_name)
         return self.get_memory(user_id=uid, agent_name=agent_name)
+
+    def cancel_by_agent(
+        self,
+        agent_name: str | None = None,
+        *,
+        user_id: str | None = None,
+    ) -> int:
+        """Cancel buffered sleep-time traces for a specific user and optional agent."""
+        uid = user_id or "default"
+        norm_agent = _normalize_agent_name(agent_name) if agent_name is not None else None
+        cancelled = 0
+        with self._sleep_lock:
+            kept: list[_RawTrace] = []
+            for t in self._pending_traces:
+                same_user = t.user_id == uid
+                same_agent = norm_agent is None or _normalize_agent_name(t.agent_name) == norm_agent
+                if same_user and same_agent:
+                    cancelled += 1
+                else:
+                    kept.append(t)
+            self._pending_traces = kept
+            if not self._pending_traces and self._sleep_timer is not None:
+                self._sleep_timer.cancel()
+                self._sleep_timer = None
+        return cancelled
 
     def delete_memory(
         self,
@@ -435,23 +589,30 @@ class AimemMemoryManager(MemoryManager):
     ) -> dict[str, Any]:
         """Import facts from a dict into Markdown and FTS5."""
         uid = user_id or "default"
+        norm_agent = _normalize_agent_name(agent_name)
         raw_facts = memory_data.get("facts", [])
         facts_to_save: list[MemoryFact] = []
         for rf in raw_facts:
             if isinstance(rf, dict) and "content" in rf:
+                fact_agent = _normalize_agent_name(rf.get("agent_name")) or norm_agent
+                fact_role = resolve_default_scope_role(fact_agent, rf.get("scope_role"))
+                raw_parents = rf.get("parent_provenance_ids") or []
+                parents = [str(p) for p in raw_parents if p] if isinstance(raw_parents, list) else []
                 facts_to_save.append(
                     MemoryFact(
                         id=str(rf.get("id", "")),
                         content=str(rf.get("content", "")),
                         category=str(rf.get("category", "profile")),
                         confidence=float(rf.get("confidence", 1.0)),
+                        agent_name=fact_agent,
+                        scope_role=fact_role,
+                        writer_id=str(rf.get("writer_id") or fact_agent or "default"),
+                        parent_provenance_ids=parents,
+                        supersedes_id=str(rf.get("supersedes_id", "")),
                     )
                 )
         for f in facts_to_save:
-            saved, superseded_id = self._storage.upsert_fact(uid, f)
-            if superseded_id:
-                self._indexer.invalidate_fact(superseded_id, invalidated_at=saved.valid_from)
-            self._indexer.upsert_fact(uid, saved)
+            self._persist_fact(uid, f)
         return self.get_memory(user_id=uid, agent_name=agent_name)
 
     # ── Fact CRUD & Hooks (Tier 3) ─────────────────────────────────────────
@@ -464,21 +625,30 @@ class AimemMemoryManager(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        scope_role: str | None = None,
+        writer_id: str | None = None,
+        parent_provenance_ids: list[str] | None = None,
+        supersedes_id: str = "",
     ) -> tuple[dict[str, Any], str | None]:
         """Create a fact directly (supports frontend UI Add Fact button)."""
         uid = user_id or "default"
         cat = "profile" if category == "context" else (category or "profile")
+        norm_agent = _normalize_agent_name(agent_name)
+        resolved_role = resolve_default_scope_role(norm_agent, scope_role)
+        resolved_writer = writer_id or norm_agent or "default"
         fact = MemoryFact(
             id="",
             content=content.strip(),
             category=cat,
             confidence=confidence,
+            agent_name=norm_agent,
+            scope_role=resolved_role,
+            writer_id=resolved_writer,
+            parent_provenance_ids=list(parent_provenance_ids or []),
+            supersedes_id=supersedes_id,
         )
-        saved, superseded_id = self._storage.upsert_fact(uid, fact)
-        if superseded_id:
-            self._indexer.invalidate_fact(superseded_id, invalidated_at=saved.valid_from)
-        self._indexer.upsert_fact(uid, saved)
-        return self.get_memory(user_id=uid, agent_name=agent_name), saved.id
+        saved, _ = self._persist_fact(uid, fact)
+        return self.get_memory(user_id=uid, agent_name=agent_name, scope_role=scope_role), saved.id
 
     def delete_fact(
         self,
@@ -486,12 +656,35 @@ class AimemMemoryManager(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        scope_role: str | None = None,
+        caller_roles: Collection[str] | None = None,
     ) -> dict[str, Any]:
-        """Delete a fact by ID (supports frontend UI Delete Fact button)."""
+        """Delete an authorized fact by ID (supports frontend UI Delete Fact button)."""
         uid = user_id or "default"
-        self._storage.delete_fact(uid, fact_id)
-        self._indexer.delete_fact(fact_id)
-        return self.get_memory(user_id=uid, agent_name=agent_name)
+        target = self._storage.get_fact_by_id(
+            uid,
+            fact_id,
+            agent_name=agent_name,
+            scope_role=scope_role,
+            caller_roles=caller_roles,
+            include_invalidated=True,
+        )
+        if target is not None:
+            deleted = self._storage.delete_fact(
+                uid,
+                fact_id,
+                agent_name=agent_name,
+                scope_role=scope_role,
+                caller_roles=caller_roles,
+            )
+            if deleted:
+                self._indexer.delete_fact(
+                    fact_id,
+                    user_id=uid,
+                    agent_name=target.agent_name,
+                    scope_role=target.scope_role,
+                )
+        return self.get_memory(user_id=uid, agent_name=agent_name, scope_role=scope_role, caller_roles=caller_roles)
 
     def update_fact(
         self,
@@ -502,11 +695,20 @@ class AimemMemoryManager(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        scope_role: str | None = None,
+        caller_roles: Collection[str] | None = None,
+        writer_id: str | None = None,
+        parent_provenance_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Update an existing fact by ID."""
+        """Update an existing authorized fact by ID with bi-temporal history preservation."""
         uid = user_id or "default"
-        facts = self._storage.load_user_facts(uid)
-        target = next((f for f in facts if f.id == fact_id), None)
+        target = self._storage.get_fact_by_id(
+            uid,
+            fact_id,
+            agent_name=agent_name,
+            scope_role=scope_role,
+            caller_roles=caller_roles,
+        )
         if target:
             if content is not None:
                 target.content = content.strip()
@@ -514,11 +716,12 @@ class AimemMemoryManager(MemoryManager):
                 target.category = category
             if confidence is not None:
                 target.confidence = confidence
-            saved, superseded_id = self._storage.upsert_fact(uid, target)
-            if superseded_id and superseded_id != target.id:
-                self._indexer.invalidate_fact(superseded_id, invalidated_at=saved.valid_from)
-            self._indexer.upsert_fact(uid, saved)
-        return self.get_memory(user_id=uid, agent_name=agent_name)
+            if writer_id is not None:
+                target.writer_id = writer_id
+            if parent_provenance_ids is not None:
+                target.parent_provenance_ids = list(parent_provenance_ids)
+            self._persist_fact(uid, target)
+        return self.get_memory(user_id=uid, agent_name=agent_name, scope_role=scope_role, caller_roles=caller_roles)
 
     def reload_memory(
         self,
@@ -528,8 +731,8 @@ class AimemMemoryManager(MemoryManager):
     ) -> dict[str, Any]:
         """Resync FTS5 index from on-disk Markdown files (e.g. after manual human edits)."""
         uid = user_id or "default"
-        facts = self._storage.load_user_facts(uid, include_invalidated=True)
-        self._indexer.sync_user_facts(uid, facts)
+        facts = self._storage.load_all_facts_for_user(uid, agent_name=agent_name, include_invalidated=True)
+        self._indexer.sync_user_facts(uid, facts, agent_name=agent_name)
         logger.info("Aimem reloaded and re-indexed %d facts for user %s", len(facts), uid)
         return self.get_memory(user_id=uid, agent_name=agent_name)
 
