@@ -642,3 +642,379 @@ class TestGitSnapshotAndRollback:
             assert "[HARNESS GUARD: CRITICAL REPETITION]" in res2.content
             # Rollback gracefully skipped since it is not a git repo
             assert res2.additional_kwargs[HARNESS_GUARD_KEY].get("workspace_rolled_back") is False
+
+
+class TestStagnantReadonlyExplorationGuard:
+    def test_config_rejects_hard_limit_below_warn_threshold(self):
+        with pytest.raises(ValueError, match="stagnant_readonly_hard_limit"):
+            HarnessGuardConfig(stagnant_readonly_warn_threshold=10, stagnant_readonly_hard_limit=5)
+
+        # 0 disables either side cleanly
+        cfg_no_hard = HarnessGuardConfig(stagnant_readonly_warn_threshold=10, stagnant_readonly_hard_limit=0)
+        assert cfg_no_hard.stagnant_readonly_hard_limit == 0
+        cfg_no_warn = HarnessGuardConfig(stagnant_readonly_warn_threshold=0, stagnant_readonly_hard_limit=10)
+        assert cfg_no_warn.stagnant_readonly_warn_threshold == 0
+
+    def test_stagnant_readonly_warning_and_action_reset(self):
+        mw = HarnessGuardMiddleware(
+            HarnessGuardConfig(
+                stagnant_readonly_warn_threshold=3,
+                stagnant_readonly_hard_limit=5,
+            )
+        )
+
+        def ok_handler(r):
+            return ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name=r.tool_call["name"])
+
+        r1 = mw.wrap_tool_call(_make_request("grep", {"pattern": "a"}, tool_call_id="c1"), ok_handler)
+        r2 = mw.wrap_tool_call(_make_request("read_file", {"path": "a.py"}, tool_call_id="c2"), ok_handler)
+        assert "STAGNATION WARNING" not in r1.content
+        assert "STAGNATION WARNING" not in r2.content
+
+        # 3rd consecutive read-only call hits warn threshold
+        r3 = mw.wrap_tool_call(_make_request("ls", {"path": "."}, tool_call_id="c3"), ok_handler)
+        assert "[HARNESS GUARD: STAGNATION WARNING]" in r3.content
+        assert r3.additional_kwargs[HARNESS_GUARD_KEY]["stagnation_warning"] is True
+
+        # A productive/mutating tool call resets the read-only streak
+        r4 = mw.wrap_tool_call(_make_request("bash", {"command": "pytest"}, tool_call_id="c4"), ok_handler)
+        assert "STAGNATION WARNING" not in r4.content
+
+        r5 = mw.wrap_tool_call(_make_request("glob", {"pattern": "*.py"}, tool_call_id="c5"), ok_handler)
+        assert "STAGNATION WARNING" not in r5.content
+
+    def test_stagnation_hard_stop_strips_readonly_calls_but_allows_action_pivot(self):
+        from langchain_core.messages import AIMessage
+
+        mw = HarnessGuardMiddleware(
+            HarnessGuardConfig(
+                stagnant_readonly_warn_threshold=2,
+                stagnant_readonly_hard_limit=3,
+            )
+        )
+        runtime = MagicMock()
+        runtime.context = {"thread_id": "t-1", "run_id": "r-1"}
+
+        def ok_handler(r):
+            return ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name=r.tool_call["name"])
+
+        for idx in range(3):
+            req = ToolCallRequest(
+                tool_call={"name": "read_file", "args": {"path": f"f{idx}.py"}, "id": f"c-{idx}"},
+                tool=None,
+                state={"messages": []},
+                runtime=runtime,
+            )
+            mw.wrap_tool_call(req, ok_handler)
+
+        # Pivoting to a productive tool call at streak >= hard_limit is NOT blocked
+        pivot_msg = AIMessage(
+            id="ai-pivot",
+            content="Let me apply the fix.",
+            tool_calls=[{"name": "str_replace", "args": {"path": "f0.py"}, "id": "c-fix"}],
+        )
+        assert mw.after_model({"messages": [pivot_msg]}, runtime) is None
+
+        # Persisting with purely read-only calls triggers hard stop and stamps stop_reason
+        readonly_msg = AIMessage(
+            id="ai-readonly",
+            content="Reading one more file.",
+            tool_calls=[{"name": "grep", "args": {"pattern": "x"}, "id": "c-more"}],
+        )
+        update = mw.after_model({"messages": [readonly_msg]}, runtime)
+        assert update is not None
+        stopped = update["messages"][0]
+        assert stopped.tool_calls == []
+        assert "[HARNESS GUARD: STAGNATION HARD STOP]" in stopped.content
+        assert runtime.context["stop_reason"] == "loop_capped"
+
+    def test_stagnation_hard_stop_e2e_agent_graph(self):
+        from langchain.agents import create_agent
+        from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langchain_core.tools import tool as as_tool
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        class _BoundFakeModel(FakeMessagesListChatModel):
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+        @as_tool("read_file")
+        def read_file_tool(path: str) -> str:
+            """Read file contents."""
+            return f"contents of {path}"
+
+        mw = HarnessGuardMiddleware(
+            HarnessGuardConfig(
+                stagnant_readonly_warn_threshold=2,
+                stagnant_readonly_hard_limit=3,
+            )
+        )
+        responses = [
+            AIMessage(id="m1", content="", tool_calls=[{"name": "read_file", "args": {"path": "a.py"}, "id": "tc1"}]),
+            AIMessage(id="m2", content="", tool_calls=[{"name": "read_file", "args": {"path": "b.py"}, "id": "tc2"}]),
+            AIMessage(id="m3", content="", tool_calls=[{"name": "read_file", "args": {"path": "c.py"}, "id": "tc3"}]),
+            # 4th call tries a 4th read_file -> after_model strips tool_calls & stops graph
+            AIMessage(id="m4", content="Still searching.", tool_calls=[{"name": "read_file", "args": {"path": "d.py"}, "id": "tc4"}]),
+        ]
+        graph = create_agent(
+            model=_BoundFakeModel(responses=responses),
+            tools=[read_file_tool],
+            middleware=[mw],
+            checkpointer=InMemorySaver(),
+        )
+        context = {"thread_id": "stagnation-thread", "run_id": "stagnation-run"}
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="Analyze the repo")]},
+            config={"configurable": {"thread_id": "stagnation-thread"}},
+            context=context,
+        )
+        final_msg = result["messages"][-1]
+        assert isinstance(final_msg, AIMessage)
+        assert final_msg.tool_calls == []
+        assert "[HARNESS GUARD: STAGNATION HARD STOP]" in final_msg.content
+        assert context["stop_reason"] == "loop_capped"
+
+
+def test_token_budget_config_enabled_by_default():
+    from deerflow.config.token_budget_config import TokenBudgetConfig
+
+    cfg = TokenBudgetConfig()
+    assert cfg.enabled is True
+    assert cfg.max_tokens == 200_000
+
+
+class TestConstraintAndSOPToolGates:
+    def test_constraint_write_path_allowlist_blocks_traversal_and_prefix_spoofing(self):
+        cfg = HarnessGuardConfig(allowed_write_paths=["/workspace/out"])
+        mw = HarnessGuardMiddleware(cfg)
+        executed = []
+
+        def _exec(req):
+            executed.append(req.tool_call["args"]["path"])
+            return ToolMessage(content="written", tool_call_id=req.tool_call["id"], name="write_file")
+
+        # Valid path under allowlist executes cleanly
+        res_ok = mw.wrap_tool_call(_make_request("write_file", {"path": "/workspace/out/report.txt", "content": "hi"}, tool_call_id="c1"), _exec)
+        assert res_ok.status != "error"
+        assert executed == ["/workspace/out/report.txt"]
+
+        # Parent traversal attack & prefix-spoofed directory must be blocked before execution
+        for idx, bad_path in enumerate(["/workspace/out/../secrets.txt", "/workspace/out_evil/pwn.txt", ""], start=2):
+            res_bad = mw.wrap_tool_call(_make_request("write_file", {"path": bad_path, "content": "x"}, tool_call_id=f"c{idx}"), _exec)
+            assert res_bad.status == "error"
+            assert "[HARNESS GUARD: TOOL CALL BLOCKED (constraint)]" in res_bad.content
+            assert res_bad.additional_kwargs[HARNESS_GUARD_KEY]["gate_blocked"] is True
+        assert executed == ["/workspace/out/report.txt"]
+
+    def test_constraint_domain_and_command_prefix_gates(self):
+        cfg = HarnessGuardConfig(
+            allowed_domains=["api.github.com", "company.org"],
+            blocked_command_prefixes=["rm -rf", "sudo", "curl | sh"],
+        )
+        mw = HarnessGuardMiddleware(cfg)
+        executed = []
+
+        def _exec(req):
+            executed.append(req.tool_call["name"])
+            return ToolMessage(content="ok", tool_call_id=req.tool_call["id"], name=req.tool_call["name"])
+
+        # Domain gate: allowed host & subdomain pass, disallowed host/email blocked
+        ok_url = mw.wrap_tool_call(_make_request("web_fetch", {"url": "https://api.github.com/repos/x"}, tool_call_id="u1"), _exec)
+        bad_url = mw.wrap_tool_call(_make_request("web_fetch", {"url": "https://evil.example.com/exfil"}, tool_call_id="u2"), _exec)
+        bad_email = mw.wrap_tool_call(_make_request("send_mail", {"to": "attacker@untrusted.io", "body": "hi"}, tool_call_id="u3"), _exec)
+        assert ok_url.status != "error"
+        assert bad_url.status == "error"
+        assert "evil.example.com" in bad_url.content
+        assert bad_email.status == "error"
+        assert "untrusted.io" in bad_email.content
+
+        # Command gate: compound command cannot smuggle blocked prefix
+        ok_cmd = mw.wrap_tool_call(_make_request("bash", {"command": "pytest tests/"}, tool_call_id="b1"), _exec)
+        bad_cmd = mw.wrap_tool_call(_make_request("bash", {"command": "echo hi && rm   -rf /tmp/x"}, tool_call_id="b2"), _exec)
+        bad_env_cmd = mw.wrap_tool_call(_make_request("bash", {"command": "FOO=bar sudo apt update"}, tool_call_id="b3"), _exec)
+        assert ok_cmd.status != "error"
+        assert bad_cmd.status == "error"
+        assert bad_env_cmd.status == "error"
+        assert executed == ["web_fetch", "bash"]
+
+    def test_sop_state_tool_gate_transition_guard_and_consume_stop_reason(self):
+        from deerflow.skills.types import SOPStateMachineSpec
+
+        spec = SOPStateMachineSpec(
+            name="release-check",
+            initial_state="read_phase",
+            exit_states=frozenset({"verified"}),
+            allowed_tools_by_state={
+                "read_phase": frozenset({"read_file"}),
+                "write_phase": frozenset({"write_file"}),
+                "verify_phase": frozenset({"bash"}),
+                "verified": frozenset(),
+            },
+            transitions={
+                "read_phase": {"read_file": "write_phase"},
+                "write_phase": {"write_file": "verify_phase"},
+                "verify_phase": {"bash": "verified"},
+            },
+        )
+        mw = HarnessGuardMiddleware(HarnessGuardConfig(), sop_spec=spec)
+
+        # Out-of-order write_file blocked in read_phase
+        blocked = mw.wrap_tool_call(_make_request("write_file", {"path": "/workspace/a.txt", "content": "hi"}, tool_call_id="s1"), lambda r: ToolMessage(content="ok", tool_call_id=r.tool_call["id"], name="write_file"))
+        assert blocked.status == "error"
+        assert "[HARNESS GUARD: TOOL CALL BLOCKED (sop)]" in blocked.content
+        assert mw.get_sop_state("t-1", "r-1") == "read_phase"
+
+        # Failed read_file must NOT advance state (control vs data plane separation)
+        failed_read = mw.wrap_tool_call(
+            _make_request("read_file", {"path": "/workspace/missing.txt"}, tool_call_id="s2"),
+            lambda r: ToolMessage(content="File not found", tool_call_id=r.tool_call["id"], name="read_file", status="error"),
+        )
+        assert failed_read.status == "error"
+        assert mw.get_sop_state("t-1", "r-1") == "read_phase"
+
+        # Transition guard rejects undeclared/skipping transition
+        ok_skip, err_skip = mw.transition_sop_state("verified", thread_id="t-1", run_id="r-1")
+        assert ok_skip is False
+        assert "not permitted" in (err_skip or "")
+
+        # Successful read_file transitions read_phase -> write_phase
+        ok_read = mw.wrap_tool_call(
+            _make_request("read_file", {"path": "/workspace/spec.txt"}, tool_call_id="s3"),
+            lambda r: ToolMessage(content="spec ok", tool_call_id=r.tool_call["id"], name="read_file"),
+        )
+        assert ok_read.status != "error"
+        assert mw.get_sop_state("t-1", "r-1") == "write_phase"
+
+        # Stagnation / stop reason consumption API check
+        runtime = MagicMock()
+        runtime.context = {"thread_id": "t-sub", "run_id": "run-sub-1"}
+        mw._record_terminal_stop_reason(runtime, "loop_capped")
+        assert mw.consume_stop_reason("run-sub-1") == "loop_capped"
+        assert mw.consume_stop_reason("run-sub-1") is None
+
+    def test_sop_stop_gate_blocks_premature_exit_then_allows_exit_state(self):
+        from langchain.agents import create_agent
+        from langchain_core.language_models import BaseChatModel
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from langchain_core.tools import tool as as_tool
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        from deerflow.skills.types import SOPStateMachineSpec
+
+        class _BoundFakeModel(BaseChatModel):
+            responses: list[AIMessage]
+            call_count: int = 0
+
+            @property
+            def _llm_type(self) -> str:
+                return "fake-sop"
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                idx = min(self.call_count, len(self.responses) - 1)
+                self.call_count += 1
+                return ChatResult(generations=[ChatGeneration(message=self.responses[idx])])
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+        @as_tool("verify")
+        def verify_tool(target: str) -> str:
+            """Verify target artifact."""
+            return f"verified {target}"
+
+        spec = SOPStateMachineSpec(
+            name="verify-before-finish",
+            initial_state="needs_verify",
+            exit_states=frozenset({"done"}),
+            allowed_tools_by_state={
+                "needs_verify": frozenset({"verify"}),
+                "done": frozenset(),
+            },
+            transitions={"needs_verify": {"verify": "done"}},
+        )
+        mw = HarnessGuardMiddleware(HarnessGuardConfig(sop_max_stop_blocks=2), sop_spec=spec)
+        responses = [
+            # Attempt 1: tries to finish without running verify -> Stop Gate jumps back to model!
+            AIMessage(id="m1", content="All done prematurely."),
+            # Attempt 2: calls verify -> advances state to 'done'
+            AIMessage(id="m2", content="", tool_calls=[{"name": "verify", "args": {"target": "app.py"}, "id": "tc1"}]),
+            # Attempt 3: finishes cleanly in exit state 'done'
+            AIMessage(id="m3", content="Verification passed and complete."),
+        ]
+        graph = create_agent(
+            model=_BoundFakeModel(responses=responses),
+            tools=[verify_tool],
+            middleware=[mw],
+            checkpointer=InMemorySaver(),
+        )
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="Ship the change")]},
+            config={"configurable": {"thread_id": "sop-thread"}},
+            context={"thread_id": "sop-thread", "run_id": "sop-run"},
+        )
+        assert result["messages"][-1].content == "Verification passed and complete."
+        assert any(
+            isinstance(m, HumanMessage) and "[HARNESS GUARD: SOP STOP GATE]" in str(m.content)
+            for m in result["messages"]
+        )
+        assert mw.get_sop_state("sop-thread", "sop-run") == "done"
+
+    def test_sop_stop_gate_caps_and_records_loop_capped(self):
+        from langchain.agents import create_agent
+        from langchain_core.language_models import BaseChatModel
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from langchain_core.tools import tool as as_tool
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        from deerflow.skills.types import SOPStateMachineSpec
+
+        class _BoundFakeModel(BaseChatModel):
+            responses: list[AIMessage]
+            call_count: int = 0
+
+            @property
+            def _llm_type(self) -> str:
+                return "fake-sop-cap"
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                idx = min(self.call_count, len(self.responses) - 1)
+                self.call_count += 1
+                return ChatResult(generations=[ChatGeneration(message=self.responses[idx])])
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+        @as_tool("verify")
+        def verify_tool(target: str) -> str:
+            """Verify target artifact."""
+            return f"verified {target}"
+
+        spec = SOPStateMachineSpec(
+            name="verify-cap",
+            initial_state="needs_verify",
+            exit_states=frozenset({"done"}),
+            allowed_tools_by_state={"needs_verify": frozenset({"verify"})},
+            transitions={"needs_verify": {"verify": "done"}},
+        )
+        mw = HarnessGuardMiddleware(HarnessGuardConfig(sop_max_stop_blocks=1), sop_spec=spec)
+        responses = [
+            AIMessage(id="m1", content="Skipping verify."),
+            AIMessage(id="m2", content="Still refusing to verify."),
+        ]
+        graph = create_agent(
+            model=_BoundFakeModel(responses=responses),
+            tools=[verify_tool],
+            middleware=[mw],
+            checkpointer=InMemorySaver(),
+        )
+        context = {"thread_id": "sop-cap-thread", "run_id": "sop-cap-run"}
+        graph.invoke(
+            {"messages": [HumanMessage(content="Finish")]},
+            config={"configurable": {"thread_id": "sop-cap-thread"}},
+            context=context,
+        )
+        assert context["stop_reason"] == "loop_capped"
+        assert mw.consume_stop_reason("sop-cap-run") == "loop_capped"

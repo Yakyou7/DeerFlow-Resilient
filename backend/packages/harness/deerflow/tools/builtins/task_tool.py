@@ -1077,6 +1077,17 @@ async def task_tool(
         executor_kwargs["loop_detection_recorder"] = middleware_recorder
         executor_kwargs["tool_promotion_recorder"] = middleware_recorder
         executor_kwargs["tool_progress_recorder"] = middleware_recorder
+    if runtime is not None:
+        raw_ledger = runtime.state.get("dual_ledger") or runtime.state.get("task_ledger")
+        if raw_ledger is not None:
+            from deerflow.subagents.typed_handoff import build_goal_ancestry
+
+            ancestry = build_goal_ancestry(
+                raw_ledger,
+                current_milestone=description or prompt,
+            )
+            if ancestry:
+                executor_kwargs["goal_ancestry"] = ancestry
     if resolved_app_config is not None:
         executor_kwargs["app_config"] = resolved_app_config
     if run_extensions is not None:

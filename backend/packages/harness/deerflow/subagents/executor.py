@@ -910,6 +910,7 @@ class SubagentExecutor:
         extensions: Any | None = None,
         execution_capacity: SubagentExecutionCapacity | None = None,
         acceptance_criteria: list[str] | None = None,
+        goal_ancestry: list[str] | None = None,
         loop_detection_recorder: Any | None = None,
         tool_promotion_recorder: Any | None = None,
         tool_progress_recorder: Any | None = None,
@@ -1023,6 +1024,9 @@ class SubagentExecutor:
         # Raw lead-supplied criteria; stripping/capping happens at render time
         # in report_contract.render_acceptance_criteria_block.
         self.acceptance_criteria = acceptance_criteria
+        # Optional <=3-level ancestor goal chain inherited from parent TaskLedger;
+        # tail-mounted in SystemMessage to preserve KV-cache prefix stability.
+        self.goal_ancestry: list[str] = [str(g).strip() for g in (goal_ancestry or []) if str(g).strip()][:3]
         self.loop_detection_recorder = loop_detection_recorder
         self.tool_promotion_recorder = tool_promotion_recorder
         self.tool_progress_recorder = tool_progress_recorder
@@ -1584,6 +1588,12 @@ class SubagentExecutor:
         mcp_routing_hints_section = get_mcp_routing_hints_prompt_section(authorized_tools, deferred_names=deferred_setup.deferred_names)
         if mcp_routing_hints_section:
             system_parts.append(mcp_routing_hints_section)
+        if self.goal_ancestry:
+            from deerflow.subagents.typed_handoff import render_goal_ancestry_block
+
+            ancestry_block = render_goal_ancestry_block(self.goal_ancestry)
+            if ancestry_block:
+                system_parts.append(ancestry_block)
 
         messages: list[Any] = []
         if system_parts:

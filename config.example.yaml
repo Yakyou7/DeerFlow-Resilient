@@ -103,7 +103,7 @@ token_usage:
 # When hard_stop_threshold is crossed, tool_calls are stripped and the agent
 # is forced to produce a final answer immediately.
 token_budget:
-  enabled: false                # Set to true to activate budget enforcement
+  enabled: true                 # Set to false to disable budget enforcement
   max_tokens: 200000            # Total token limit (input + output) per run
   max_input_tokens: null        # Optional separate input-only limit
   max_output_tokens: null       # Optional separate output-only limit

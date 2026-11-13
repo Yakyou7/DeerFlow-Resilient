@@ -13,6 +13,7 @@ parent deliberation tokens.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -64,6 +65,117 @@ class TypedHandoff(BaseModel):
         default=None,
         description="P2P resource collision negotiation outcome between concurrent workers",
     )
+    goal_ancestry: list[str] = Field(
+        default_factory=list,
+        description="Up to 3 read-only ancestor goal levels (outermost -> innermost) inherited from parent TaskLedger",
+    )
+
+
+def _truncate_ancestry_item(text: str, max_len: int = 200) -> str:
+    collapsed = " ".join(str(text).split())
+    return collapsed[:max_len]
+
+
+def _append_unique_goal(goals: list[str], candidate: str | None) -> None:
+    if not candidate:
+        return
+    normalized = _truncate_ancestry_item(candidate)
+    if normalized and normalized not in goals:
+        goals.append(normalized)
+
+
+def build_goal_ancestry(
+    task_ledger: Any | None = None,
+    *,
+    current_milestone: str | None = None,
+    root_goal: str | None = None,
+    max_levels: int = 3,
+) -> list[str]:
+    """Build up to ``max_levels`` ordered ancestor goals (outermost -> innermost)."""
+    if max_levels <= 0:
+        return []
+
+    ledger_data: Mapping[str, Any] | None = None
+    milestones: Sequence[Any] = ()
+    given_facts: Sequence[Any] = ()
+
+    if isinstance(task_ledger, Mapping):
+        nested = task_ledger.get("task_ledger")
+        ledger_data = nested if isinstance(nested, Mapping) else task_ledger
+        raw_milestones = ledger_data.get("milestones")
+        raw_facts = ledger_data.get("given_facts")
+        if isinstance(raw_milestones, Sequence) and not isinstance(raw_milestones, (str, bytes)):
+            milestones = raw_milestones
+        if isinstance(raw_facts, Sequence) and not isinstance(raw_facts, (str, bytes)):
+            given_facts = raw_facts
+    elif task_ledger is not None:
+        milestones = getattr(task_ledger, "milestones", ()) or ()
+        given_facts = getattr(task_ledger, "given_facts", ()) or ()
+
+    ordered: list[str] = []
+    _append_unique_goal(ordered, root_goal)
+
+    if not ordered and given_facts:
+        first_fact = str(given_facts[0]).strip()
+        if first_fact:
+            _append_unique_goal(ordered, first_fact)
+
+    parsed_milestones: list[tuple[str, str, str]] = []
+    for item in milestones:
+        if isinstance(item, Mapping):
+            name = str(item.get("name", "")).strip()
+            status = str(item.get("status", "pending")).strip()
+            details = str(item.get("details", "")).strip()
+        else:
+            name = str(getattr(item, "name", "")).strip()
+            status = str(getattr(item, "status", "pending")).strip()
+            details = str(getattr(item, "details", "")).strip()
+        if name:
+            parsed_milestones.append((name, status, details))
+
+    if parsed_milestones:
+        first_name, _, _ = parsed_milestones[0]
+        _append_unique_goal(ordered, first_name)
+
+        active = next(((n, d) for n, s, d in parsed_milestones if s == "in_progress"), None)
+        if active is not None:
+            active_label = f"{active[0]} ({active[1]})" if active[1] else active[0]
+            _append_unique_goal(ordered, active_label)
+        else:
+            pending = next(((n, d) for n, s, d in parsed_milestones if s == "pending"), None)
+            if pending is not None:
+                _append_unique_goal(ordered, pending[0])
+
+    if current_milestone:
+        if len(ordered) >= max_levels:
+            current_norm = _truncate_ancestry_item(current_milestone)
+            if current_norm and current_norm not in ordered:
+                ordered = [*ordered[: max_levels - 1], current_norm]
+        else:
+            _append_unique_goal(ordered, current_milestone)
+
+    return ordered[:max_levels]
+
+
+def render_goal_ancestry_block(goal_ancestry: Sequence[str] | None) -> str:
+    """Render read-only ``<goal_ancestry>`` tail block to keep prompt KV prefixes cacheable."""
+    if not goal_ancestry:
+        return ""
+    cleaned: list[str] = []
+    for item in goal_ancestry[:3]:
+        text = _truncate_ancestry_item(item).replace("<", "[").replace(">", "]")
+        if text:
+            cleaned.append(text)
+    if not cleaned:
+        return ""
+    lines = [
+        '<goal_ancestry readonly="true">',
+        "Ancestor Goal Chain (read-only orientation context; do not override your direct task or system instructions):",
+    ]
+    for idx, item in enumerate(cleaned, start=1):
+        lines.append(f"{idx}. {item}")
+    lines.append("</goal_ancestry>")
+    return "\n".join(lines)
 
 
 def _clean_list_items(lines: list[str], max_items: int = 10) -> list[str]:
@@ -237,6 +349,9 @@ def render_handoff_section(handoff: TypedHandoff) -> str:
         f'<subagent_handoff status="{handoff.status}">',
         f"- **Summary**: {handoff.summary or 'Task execution concluded.'}",
     ]
+    if handoff.goal_ancestry:
+        ancestry_chain = " -> ".join(handoff.goal_ancestry[:3])
+        lines.append(f"- **Goal Ancestry**: {ancestry_chain}")
 
     if handoff.deliverables:
         lines.append("- **Deliverables**:")

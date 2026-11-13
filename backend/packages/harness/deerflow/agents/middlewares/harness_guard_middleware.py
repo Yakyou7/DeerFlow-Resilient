@@ -15,23 +15,34 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import subprocess
 import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, override
 
+from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import ToolMessage
+from langchain.agents.middleware.types import hook_config
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.runtime import Runtime
 from langgraph.types import Command
 
 from deerflow.agents.middlewares._bounded_dict import BoundedDict
+from deerflow.agents.middlewares.harness_tool_gates import (
+    evaluate_constraint_tool_gate,
+    evaluate_sop_tool_gate,
+    format_sop_stop_gate_message,
+    known_sop_states,
+    next_sop_state,
+)
+from deerflow.agents.middlewares.tool_call_metadata import clone_ai_message_with_tool_calls
 from deerflow.agents.middlewares.tool_result_meta import (
     TOOL_META_KEY,
     _command_messages,
@@ -39,11 +50,25 @@ from deerflow.agents.middlewares.tool_result_meta import (
 )
 from deerflow.config.harness_guard_config import HarnessGuardConfig
 from deerflow.sandbox.tools import read_current_file_content
+from deerflow.skills.types import SOPStateMachineSpec
 
 logger = logging.getLogger(__name__)
 
 HARNESS_GUARD_KEY = "deerflow_harness_guard"
 _WRITE_TOOLS = frozenset({"write_file", "str_replace"})
+_READONLY_EXPLORATION_TOOLS = frozenset(
+    {
+        "ls",
+        "glob",
+        "grep",
+        "read_file",
+        "view_image",
+        "web_search",
+        "web_fetch",
+        "memory_search",
+        "memory_get",
+    }
+)
 
 type _ScopeKey = tuple[str, str | None]
 
@@ -340,8 +365,13 @@ class GitSnapshotManager:
 class HarnessGuardMiddleware(AgentMiddleware):
     """Tool-loop interceptor for write syntax verification, error hints, and anti-doom-loop."""
 
-    def __init__(self, config: HarnessGuardConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: HarnessGuardConfig | None = None,
+        sop_spec: SOPStateMachineSpec | None = None,
+    ) -> None:
         self.config = config if config is not None else HarnessGuardConfig()
+        self._default_sop_spec = sop_spec
         self._lock = threading.Lock()
         self._fallback_run_ids: OrderedDict[int, tuple[object, str]] = OrderedDict()
         self._max_fallback_run_ids = max(1, self.config.max_tracked_scopes * 2)
@@ -352,6 +382,13 @@ class HarnessGuardMiddleware(AgentMiddleware):
         self._collected_dpo_pairs: deque[DPOPreferencePair] = deque(maxlen=1000)
         # SWE-Search Git Snapshots: bounded tracking of last known healthy snapshot per scope
         self._snapshots: BoundedDict[_ScopeKey, str] = BoundedDict(maxsize=self.config.max_tracked_scopes)
+        # Quiet runaway protection: consecutive read-only exploration steps per scope
+        self._readonly_streaks: BoundedDict[_ScopeKey, int] = BoundedDict(maxsize=self.config.max_tracked_scopes)
+        # Executable SOP state ledger (stored outside LLM context) and terminal stop reasons
+        self._sop_specs: BoundedDict[_ScopeKey, SOPStateMachineSpec] = BoundedDict(maxsize=self.config.max_tracked_scopes)
+        self._sop_states: BoundedDict[_ScopeKey, str] = BoundedDict(maxsize=self.config.max_tracked_scopes)
+        self._sop_stop_blocks: BoundedDict[_ScopeKey, int] = BoundedDict(maxsize=self.config.max_tracked_scopes)
+        self._stop_reason: BoundedDict[str | None, str] = BoundedDict(maxsize=self.config.max_tracked_scopes)
 
     @property
     def collected_dpo_pairs(self) -> list[DPOPreferencePair]:
@@ -467,6 +504,143 @@ class HarnessGuardMiddleware(AgentMiddleware):
     def _scope_key(self, request: ToolCallRequest) -> _ScopeKey:
         return self._get_thread_id(request.runtime), self._get_run_id(request.runtime)
 
+    def _record_terminal_stop_reason(self, runtime: Any, reason: str) -> None:
+        ctx = getattr(runtime, "context", None)
+        raw_run_id: str | None = None
+        if isinstance(ctx, dict):
+            ctx["stop_reason"] = reason
+            candidate = ctx.get("run_id")
+            if isinstance(candidate, str) and candidate:
+                raw_run_id = candidate
+        with self._lock:
+            self._stop_reason[raw_run_id] = reason
+
+    def consume_stop_reason(self, run_id: str | None = None) -> str | None:
+        """Consume any terminal stop reason recorded by HarnessGuard for ``run_id``."""
+        with self._lock:
+            return self._stop_reason.pop(run_id, None)
+
+    def _resolve_sop_spec_locked(self, scope: _ScopeKey, state: Mapping[str, Any] | AgentState | None = None) -> SOPStateMachineSpec | None:
+        spec = self._sop_specs.get(scope) or self._sop_specs.get((scope[0], None)) or self._default_sop_spec
+        if spec is None and state is not None:
+            candidate = state.get("sop_spec") if isinstance(state, Mapping) else getattr(state, "sop_spec", None)
+            if isinstance(candidate, SOPStateMachineSpec):
+                spec = candidate
+                self._sop_specs[scope] = spec
+        if spec is not None and scope not in self._sop_states:
+            self._sop_states[scope] = spec.initial_state
+        return spec
+
+    def register_sop(
+        self,
+        spec: SOPStateMachineSpec,
+        *,
+        thread_id: str = "__default__",
+        run_id: str | None = None,
+    ) -> None:
+        """Attach an executable SOP state machine outside LLM context."""
+        scope: _ScopeKey = (thread_id, run_id)
+        with self._lock:
+            self._sop_specs[scope] = spec
+            self._sop_states[scope] = spec.initial_state
+            self._sop_stop_blocks[scope] = 0
+
+    def get_sop_state(self, thread_id: str = "__default__", run_id: str | None = None) -> str | None:
+        """Read current out-of-context SOP state for a scope."""
+        scope: _ScopeKey = (thread_id, run_id)
+        with self._lock:
+            spec = self._resolve_sop_spec_locked(scope)
+            if spec is None:
+                return None
+            return self._sop_states.get(scope, spec.initial_state)
+
+    def transition_sop_state(
+        self,
+        next_state: str,
+        *,
+        thread_id: str = "__default__",
+        run_id: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Guarded transition rejecting undeclared states or disallowed edges."""
+        scope: _ScopeKey = (thread_id, run_id)
+        with self._lock:
+            spec = self._resolve_sop_spec_locked(scope)
+            if spec is None:
+                return False, "No active SOP state machine registered for scope."
+            valid = known_sop_states(spec)
+            if next_state not in valid:
+                return False, f"State '{next_state}' is not declared in SOP '{spec.name}' ({sorted(valid)})."
+            current = self._sop_states.get(scope, spec.initial_state)
+            declared_targets = set(spec.transitions.get(current, {}).values()) | set(spec.transitions.get("*", {}).values())
+            if next_state != current and declared_targets and next_state not in declared_targets:
+                return False, f"Transition '{current}' -> '{next_state}' is not permitted in SOP '{spec.name}'."
+            self._sop_states[scope] = next_state
+            self._sop_stop_blocks[scope] = 0
+            return True, None
+
+    def _build_gate_block_message(self, request: ToolCallRequest, reason: str, gate_kind: str) -> ToolMessage:
+        tool_call = request.tool_call or {}
+        tool_name = str(tool_call.get("name") or "")
+        tool_call_id = str(tool_call.get("id") or "unknown")
+        msg = ToolMessage(
+            content=f"[HARNESS GUARD: TOOL CALL BLOCKED ({gate_kind})] {reason}",
+            tool_call_id=tool_call_id,
+            name=tool_name,
+            status="error",
+            additional_kwargs={
+                HARNESS_GUARD_KEY: {
+                    "gate_blocked": True,
+                    "gate_kind": gate_kind,
+                    "blocked_reason": reason,
+                },
+                TOOL_META_KEY: {
+                    "tool_name": tool_name,
+                    "error_type": f"harness_gate_{gate_kind}",
+                    "blocked_pre_execution": True,
+                },
+            },
+        )
+        return normalize_tool_result(msg)
+
+    def _check_constraint_tool_gate(self, request: ToolCallRequest) -> ToolMessage | None:
+        tool_call = request.tool_call or {}
+        tool_name = str(tool_call.get("name") or "")
+        if not tool_name:
+            return None
+        args = tool_call.get("args") or {}
+        reason = evaluate_constraint_tool_gate(tool_name, args, self.config)
+        if reason is not None:
+            return self._build_gate_block_message(request, reason, "constraint")
+
+        scope = self._scope_key(request)
+        state = getattr(request, "state", None)
+        with self._lock:
+            spec = self._resolve_sop_spec_locked(scope, state=state)
+            if spec is not None:
+                current_state = self._sop_states.get(scope, spec.initial_state)
+                sop_reason = evaluate_sop_tool_gate(spec, current_state, tool_name)
+                if sop_reason is not None:
+                    return self._build_gate_block_message(request, sop_reason, "sop")
+        return None
+
+    def _advance_sop_after_tool(self, request: ToolCallRequest, msg: ToolMessage) -> None:
+        if getattr(msg, "status", "success") == "error":
+            return
+        tool_name = str((request.tool_call or {}).get("name") or "")
+        if not tool_name:
+            return
+        scope = self._scope_key(request)
+        state = getattr(request, "state", None)
+        with self._lock:
+            spec = self._resolve_sop_spec_locked(scope, state=state)
+            if spec is None:
+                return
+            current_state = self._sop_states.get(scope, spec.initial_state)
+            updated = next_sop_state(spec, current_state, tool_name, succeeded=True)
+            if updated != current_state:
+                self._sop_states[scope] = updated
+                self._sop_stop_blocks[scope] = 0
+
     def _check_write_syntax_block(self, request: ToolCallRequest) -> ToolMessage | None:
         """Perform pre-execution syntax validation on write operations."""
         if not self.config.write_verify_syntax:
@@ -567,6 +741,7 @@ class HarnessGuardMiddleware(AgentMiddleware):
 
         repetition_warning: str | None = None
         oscillation_warning: str | None = None
+        stagnation_warning: str | None = None
 
         with self._lock:
             # Check consecutive identical error signatures
@@ -589,6 +764,19 @@ class HarnessGuardMiddleware(AgentMiddleware):
                     oscillation_warning = f"[HARNESS GUARD: OSCILLATION DETECTED] Alternating failing tool loop detected between '{r0.tool_name}' and '{r1.tool_name}'. Pause and re-evaluate your strategy."
 
             history.append(record)
+
+            # Track consecutive read-only exploration steps without any productive/mutating action
+            if tool_name in _READONLY_EXPLORATION_TOOLS:
+                streak = self._readonly_streaks.get(scope, 0) + 1
+                self._readonly_streaks[scope] = streak
+                if self.config.stagnant_readonly_warn_threshold > 0 and streak >= self.config.stagnant_readonly_warn_threshold:
+                    stagnation_warning = (
+                        f"[HARNESS GUARD: STAGNATION WARNING] You have executed {streak} consecutive read-only exploration calls "
+                        f"without taking action or synthesizing results. Stop exploring, consolidate your findings, and either "
+                        f"execute a concrete step or produce your final answer."
+                    )
+            else:
+                self._readonly_streaks[scope] = 0
 
         call_args = request.tool_call.get("args") if isinstance(request.tool_call, dict) else getattr(request.tool_call, "args", {}) or {}
         call_args_dict = dict(call_args) if isinstance(call_args, dict) else {}
@@ -650,6 +838,8 @@ class HarnessGuardMiddleware(AgentMiddleware):
             injected_parts.append(repetition_warning)
         if oscillation_warning:
             injected_parts.append(oscillation_warning)
+        if stagnation_warning:
+            injected_parts.append(stagnation_warning)
         if workspace_rolled_back and restored_snapshot_id:
             rollback_notice = (
                 f"[HARNESS GUARD: WORKSPACE ROLLED BACK] Persistent loop detected. "
@@ -679,6 +869,7 @@ class HarnessGuardMiddleware(AgentMiddleware):
                     "error_signature": sig_str,
                     "repetition_warning": repetition_warning is not None,
                     "oscillation_warning": oscillation_warning is not None,
+                    "stagnation_warning": stagnation_warning is not None,
                     "workspace_rolled_back": workspace_rolled_back,
                     "snapshot_restored": restored_snapshot_id,
                 }
@@ -693,6 +884,7 @@ class HarnessGuardMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         """Handle ToolMessage directly or inspect Command.update messages."""
         if isinstance(result, ToolMessage):
+            self._advance_sop_after_tool(request, result)
             return self._post_process_tool_message(request, result)
         if isinstance(result, Command):
             messages = _command_messages(result)
@@ -700,6 +892,7 @@ class HarnessGuardMiddleware(AgentMiddleware):
                 tool_call_id = request.tool_call.get("id")
                 for msg in messages:
                     if isinstance(msg, ToolMessage) and (not tool_call_id or msg.tool_call_id == tool_call_id):
+                        self._advance_sop_after_tool(request, msg)
                         self._post_process_tool_message(request, msg)
         return result
 
@@ -712,12 +905,129 @@ class HarnessGuardMiddleware(AgentMiddleware):
         if not self.config.enabled:
             return handler(request)
 
-        blocked = self._check_write_syntax_block(request)
+        blocked = self._check_constraint_tool_gate(request) or self._check_write_syntax_block(request)
         if blocked is not None:
             return blocked
 
         result = handler(request)
         return self._post_process_result(request, result)
+
+    @staticmethod
+    def _append_stop_notice(content: Any, stop_msg: str) -> Any:
+        if content is None:
+            return stop_msg
+        if isinstance(content, str):
+            return f"{content}\n\n{stop_msg}" if content else stop_msg
+        if isinstance(content, list):
+            new_content = list(content)
+            new_content.append({"type": "text", "text": f"\n\n{stop_msg}"})
+            return new_content
+        return f"{content}\n\n{stop_msg}"
+
+    def _apply_stagnation_hard_stop(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+        """Strip consecutive read-only tool calls after hitting stagnant_readonly_hard_limit."""
+        if not self.config.enabled or self.config.stagnant_readonly_hard_limit <= 0:
+            return None
+
+        messages = state.get("messages", [])
+        if not messages:
+            return None
+
+        last_msg = messages[-1]
+        tool_calls = getattr(last_msg, "tool_calls", None)
+        if not isinstance(last_msg, AIMessage) or not tool_calls:
+            return None
+
+        scope = (self._get_thread_id(runtime), self._get_run_id(runtime))
+        with self._lock:
+            streak = self._readonly_streaks.get(scope, 0)
+
+        if streak < self.config.stagnant_readonly_hard_limit:
+            return None
+
+        # Allow the model to proceed if it pivots to at least one productive/mutating tool call
+        if not all((tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)) in _READONLY_EXPLORATION_TOOLS for tc in tool_calls):
+            return None
+
+        logger.warning(
+            "HarnessGuard triggered stagnation hard stop for scope %s after %d consecutive read-only calls",
+            scope,
+            streak,
+        )
+        self._record_terminal_stop_reason(runtime, "loop_capped")
+
+        stop_msg = (
+            f"[HARNESS GUARD: STAGNATION HARD STOP] Execution paused after {streak} consecutive "
+            f"read-only exploration calls without action. Producing final answer with findings gathered so far."
+        )
+        stopped_msg = clone_ai_message_with_tool_calls(
+            last_msg,
+            [],
+            content=self._append_stop_notice(last_msg.content, stop_msg),
+        )
+        return {"messages": [stopped_msg]}
+
+    def _apply_sop_stop_gate(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+        """Reject premature completion when active SOP state is not a declared exit state."""
+        if not self.config.enabled or self.config.sop_max_stop_blocks <= 0:
+            return None
+
+        messages = state.get("messages", [])
+        if not messages:
+            return None
+        last_msg = messages[-1]
+        if not isinstance(last_msg, AIMessage):
+            return None
+        if getattr(last_msg, "tool_calls", None) or getattr(last_msg, "invalid_tool_calls", None):
+            return None
+        kwargs = getattr(last_msg, "additional_kwargs", None) or {}
+        if kwargs.get("deerflow_error_fallback") or kwargs.get("model_length_termination"):
+            return None
+
+        ctx = getattr(runtime, "context", None)
+        if isinstance(ctx, dict) and ctx.get("stop_reason"):
+            return None
+
+        scope = (self._get_thread_id(runtime), self._get_run_id(runtime))
+        capped = False
+        with self._lock:
+            spec = self._resolve_sop_spec_locked(scope, state=state)
+            if spec is None or not spec.exit_states:
+                return None
+            current_state = self._sop_states.get(scope, spec.initial_state)
+            if current_state in spec.exit_states:
+                return None
+            blocks = self._sop_stop_blocks.get(scope, 0)
+            if blocks >= self.config.sop_max_stop_blocks:
+                capped = True
+            else:
+                self._sop_stop_blocks[scope] = blocks + 1
+
+        if capped:
+            self._record_terminal_stop_reason(runtime, "loop_capped")
+            return None
+
+        prompt = format_sop_stop_gate_message(spec, current_state)
+        return {
+            "messages": [HumanMessage(content=prompt, name="harness_sop_stop_gate")],
+            "jump_to": "model",
+        }
+
+    @hook_config(can_jump_to=["model"])
+    @override
+    def after_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+        stagnation = self._apply_stagnation_hard_stop(state, runtime)
+        if stagnation is not None:
+            return stagnation
+        return self._apply_sop_stop_gate(state, runtime)
+
+    @hook_config(can_jump_to=["model"])
+    @override
+    async def aafter_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+        stagnation = self._apply_stagnation_hard_stop(state, runtime)
+        if stagnation is not None:
+            return stagnation
+        return self._apply_sop_stop_gate(state, runtime)
 
     @override
     async def awrap_tool_call(
@@ -728,7 +1038,7 @@ class HarnessGuardMiddleware(AgentMiddleware):
         if not self.config.enabled:
             return await handler(request)
 
-        blocked = await asyncio.to_thread(self._check_write_syntax_block, request)
+        blocked = self._check_constraint_tool_gate(request) or await asyncio.to_thread(self._check_write_syntax_block, request)
         if blocked is not None:
             return blocked
 

@@ -1358,6 +1358,41 @@ class TestAgentConstruction:
         assert state["messages"][1].content == "Do the task"
 
     @pytest.mark.anyio
+    async def test_build_initial_state_mounts_goal_ancestry_at_system_prompt_tail(
+        self,
+        classes,
+        base_config,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        SubagentExecutor = classes["SubagentExecutor"]
+
+        monkeypatch.setattr(
+            sys.modules["deerflow.skills.storage"],
+            "get_or_new_user_skill_storage",
+            lambda user_id, *, app_config=None: SimpleNamespace(load_skills=lambda *, enabled_only: []),
+        )
+
+        base_exec = SubagentExecutor(config=base_config, tools=[], thread_id="test-thread", goal_ancestry=None)
+        ancestry_exec = SubagentExecutor(
+            config=base_config,
+            tools=[],
+            thread_id="test-thread",
+            goal_ancestry=["Root Mission", "Active Milestone", "Leaf Task"],
+        )
+
+        base_state, _, _ = await base_exec._build_initial_state("Do the task")
+        anc_state, _, _ = await ancestry_exec._build_initial_state("Do the task")
+
+        base_sys = base_state["messages"][0].content
+        anc_sys = anc_state["messages"][0].content
+
+        # Tail-mounted: identical prefix preserves KV cache across subtasks
+        assert anc_sys.startswith(base_sys)
+        assert anc_sys.endswith("</goal_ancestry>")
+        assert "1. Root Mission" in anc_sys
+        assert "3. Leaf Task" in anc_sys
+
+    @pytest.mark.anyio
     async def test_build_initial_state_defers_mcp_tools_when_tool_search_enabled(
         self,
         classes,

@@ -109,3 +109,31 @@ class TestDynamicSkillRouter:
         assert "Skill: pptx-generator" in rendered
         assert "Allowed Tools: write_file, bash" in rendered
         assert "</activated_skills>" in rendered
+
+    def test_skill_sop_spec_rendering_and_extraction(self):
+        from deerflow.skills.types import SOPStateMachineSpec
+
+        spec = SOPStateMachineSpec(
+            name="deploy-flow",
+            initial_state="plan",
+            exit_states=frozenset({"deployed"}),
+            allowed_tools_by_state={"plan": frozenset({"read_file"})},
+            transitions={"plan": {"read_file": "deployed"}},
+        )
+        skill = Skill(
+            name="deploy-assistant",
+            description="Safe staged deployment workflow",
+            license="MIT",
+            skill_dir=Path("/mnt/skills/deploy"),
+            skill_file=Path("/mnt/skills/deploy/SKILL.md"),
+            relative_path=Path("deploy"),
+            category=SkillCategory.PUBLIC,
+            enabled=True,
+            sop_spec=spec,
+        )
+        router = DynamicSkillRouter([skill])
+        matches = router.route_intent("Run deploy-assistant workflow", threshold=0.2)
+        rendered = router.render_jit_skill_context(matches)
+        assert "SOP State Machine: deploy-flow (initial=plan, exit=deployed)" in rendered
+        extracted = router.extract_sop_specs(matches)
+        assert extracted == [spec]

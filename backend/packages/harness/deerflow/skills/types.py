@@ -38,6 +38,17 @@ class SecretRequirement:
 
 
 @dataclass(frozen=True)
+class SOPStateMachineSpec:
+    """Executable SOP state permission & transition contract (outside LLM context)."""
+
+    name: str
+    initial_state: str
+    exit_states: frozenset[str] = field(default_factory=frozenset)
+    allowed_tools_by_state: dict[str, frozenset[str]] = field(default_factory=dict)
+    transitions: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Skill:
     """Represents a skill with its metadata and file path"""
 
@@ -55,6 +66,7 @@ class Skill:
     # autonomous model load (skill_context), or only on explicit /slash
     # activation. Frontmatter: ``secrets-autonomous`` (default true).
     secrets_autonomous: bool = True
+    sop_spec: SOPStateMachineSpec | None = None
 
     @property
     def skill_path(self) -> str:

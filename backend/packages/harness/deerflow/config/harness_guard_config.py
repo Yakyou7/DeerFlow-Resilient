@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class HarnessGuardConfig(BaseModel):
@@ -64,3 +64,41 @@ class HarnessGuardConfig(BaseModel):
         default=None,
         description="Optional explicit root directory for the Git workspace",
     )
+    stagnant_readonly_warn_threshold: int = Field(
+        default=12,
+        ge=0,
+        description="Consecutive read-only exploration tool calls without an action step before injecting a convergence warning (0 disables)",
+    )
+    stagnant_readonly_hard_limit: int = Field(
+        default=24,
+        ge=0,
+        description="Consecutive read-only exploration tool calls before stripping read-only tool_calls in after_model to force convergence (0 disables hard stop)",
+    )
+    allowed_write_paths: list[str] = Field(
+        default_factory=list,
+        description="Optional path prefixes allowed for file write/edit tools (empty disables write-path allowlist gate)",
+    )
+    allowed_domains: list[str] = Field(
+        default_factory=list,
+        description="Optional host/domain allowlist enforced on URL/email tool arguments (empty disables domain allowlist gate)",
+    )
+    blocked_command_prefixes: list[str] = Field(
+        default_factory=list,
+        description="Optional forbidden command prefixes blocked before shell tool execution (empty disables command gate)",
+    )
+    sop_max_stop_blocks: int = Field(
+        default=3,
+        ge=0,
+        description="Maximum consecutive premature stop attempts blocked by an active SOP state machine before surfacing loop_capped (0 disables Stop Gate)",
+    )
+
+    @model_validator(mode="after")
+    def validate_stagnant_readonly_limits(self) -> HarnessGuardConfig:
+        """Ensure hard limit does not trigger before the warning threshold when both are active."""
+        if (
+            self.stagnant_readonly_hard_limit > 0
+            and self.stagnant_readonly_warn_threshold > 0
+            and self.stagnant_readonly_hard_limit < self.stagnant_readonly_warn_threshold
+        ):
+            raise ValueError("stagnant_readonly_hard_limit must be >= stagnant_readonly_warn_threshold")
+        return self

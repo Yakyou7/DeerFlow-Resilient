@@ -15,7 +15,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from deerflow.skills.types import Skill
+from deerflow.skills.types import Skill, SOPStateMachineSpec
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _STOP_WORDS = frozenset(
@@ -167,7 +167,22 @@ class DynamicSkillRouter:
             if skill.allowed_tools:
                 tools_str = ", ".join(skill.allowed_tools) if isinstance(skill.allowed_tools, (list, tuple)) else str(skill.allowed_tools)
                 lines.append(f"Allowed Tools: {tools_str}")
+            if skill.sop_spec is not None:
+                exit_str = ", ".join(sorted(skill.sop_spec.exit_states)) or "none"
+                lines.append(f"SOP State Machine: {skill.sop_spec.name} (initial={skill.sop_spec.initial_state}, exit={exit_str})")
             lines.append("")
 
         lines.append("</activated_skills>")
         return "\n".join(lines)
+
+    @staticmethod
+    def extract_sop_specs(matched_results: list[SkillMatchResult]) -> list[SOPStateMachineSpec]:
+        """Return deduplicated SOPStateMachineSpec objects attached to matched skills."""
+        seen: set[str] = set()
+        specs: list[SOPStateMachineSpec] = []
+        for match in matched_results:
+            spec = getattr(match.skill, "sop_spec", None)
+            if spec is not None and spec.name not in seen:
+                seen.add(spec.name)
+                specs.append(spec)
+        return specs
