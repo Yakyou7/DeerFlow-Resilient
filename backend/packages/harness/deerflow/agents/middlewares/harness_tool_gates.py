@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import posixpath
 import re
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 from deerflow.skills.types import SOPStateMachineSpec
@@ -15,6 +17,44 @@ if TYPE_CHECKING:
 
 _WRITE_PATH_TOOLS = frozenset({"write_file", "str_replace", "edit_file"})
 _SHELL_TOOLS = frozenset({"bash", "execute", "shell"})
+_CODE_ACTION_TOOLS = frozenset({"execute_python", "python_exec", "run_python", "code_action", "local_python"})
+
+_DEFAULT_ALLOWED_LOCAL_IMPORTS = frozenset(
+    {"collections", "datetime", "functools", "itertools", "json", "math", "re", "statistics", "typing"}
+)
+_FORBIDDEN_AST_CALLS = frozenset(
+    {"eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "dir", "breakpoint", "input", "memoryview"}
+)
+_SANDBOX_REQUIRED_CALLS = frozenset({"open"})
+_SANDBOX_REQUIRED_MODULES = frozenset(
+    {
+        "asyncio",
+        "builtins",
+        "ctypes",
+        "fcntl",
+        "glob",
+        "http",
+        "importlib",
+        "io",
+        "marshal",
+        "multiprocessing",
+        "os",
+        "pathlib",
+        "pickle",
+        "pty",
+        "requests",
+        "shutil",
+        "signal",
+        "socket",
+        "sqlite3",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "threading",
+        "urllib",
+        "httpx",
+    }
+)
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
@@ -86,6 +126,148 @@ def _extract_command_segments(command: str) -> list[str]:
     return segments
 
 
+@dataclass(frozen=True)
+class CodeExecutionDecision:
+    """Two-tier AST security classification for Python code actions."""
+
+    allowed_local: bool
+    tier: Literal["blocked", "local_ast", "sandbox"]
+    reason: str | None = None
+    findings: tuple[str, ...] = ()
+
+
+def classify_code_execution_tier(
+    code: str,
+    *,
+    allowed_imports: Collection[str] | None = None,
+) -> CodeExecutionDecision:
+    """Inspect Python source via ``ast.parse`` and assign an execution tier.
+
+    - ``blocked``: syntax errors, dynamic code-eval/import primitives
+      (``eval``, ``exec``, ``compile``, ``__import__``, ``getattr``/``setattr``),
+      or dunder attribute escapes (``__class__``, ``__subclasses__``, etc.).
+    - ``sandbox``: IO/system primitives (``open``, ``os``, ``subprocess``,
+      ``pathlib``, ``socket``, etc.) or modules outside ``allowed_imports``,
+      which MUST downgrade to an isolated sandbox and never run locally.
+    - ``local_ast``: pure-memory operations eligible for bounded in-process AST
+      evaluation.
+    """
+    if not isinstance(code, str) or not code.strip():
+        return CodeExecutionDecision(
+            allowed_local=False,
+            tier="blocked",
+            reason="Empty or non-string Python code payload.",
+            findings=("empty_code",),
+        )
+
+    try:
+        tree = ast.parse(code, mode="exec")
+    except (SyntaxError, ValueError) as exc:
+        return CodeExecutionDecision(
+            allowed_local=False,
+            tier="blocked",
+            reason=f"AST syntax error: {exc}",
+            findings=("syntax_error",),
+        )
+
+    whitelist = frozenset(
+        str(m).strip().split(".")[0]
+        for m in (allowed_imports if allowed_imports is not None else _DEFAULT_ALLOWED_LOCAL_IMPORTS)
+        if str(m).strip()
+    )
+
+    blocked_findings: list[str] = []
+    sandbox_findings: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_mod = alias.name.split(".")[0]
+                if top_mod == "builtins":
+                    blocked_findings.append("import:builtins")
+                elif top_mod in _SANDBOX_REQUIRED_MODULES or top_mod not in whitelist:
+                    sandbox_findings.append(f"import:{top_mod}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                sandbox_findings.append("relative_import")
+            elif node.module:
+                top_mod = node.module.split(".")[0]
+                if top_mod == "builtins":
+                    blocked_findings.append("import:builtins")
+                elif top_mod in _SANDBOX_REQUIRED_MODULES or top_mod not in whitelist:
+                    sandbox_findings.append(f"import:{top_mod}")
+            else:
+                sandbox_findings.append("import:unknown")
+        elif isinstance(node, ast.Name):
+            if node.id.startswith("__"):
+                blocked_findings.append(f"dunder_name:{node.id}")
+            elif node.id in _FORBIDDEN_AST_CALLS:
+                blocked_findings.append(f"forbidden_symbol:{node.id}")
+            elif node.id in _SANDBOX_REQUIRED_CALLS:
+                sandbox_findings.append(f"io_call:{node.id}")
+            elif node.id in _SANDBOX_REQUIRED_MODULES:
+                sandbox_findings.append(f"module_ref:{node.id}")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                blocked_findings.append(f"dunder_attr:{node.attr}")
+            elif node.attr in _FORBIDDEN_AST_CALLS:
+                blocked_findings.append(f"forbidden_attr:{node.attr}")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                fn = node.func.id
+                if fn in _FORBIDDEN_AST_CALLS:
+                    blocked_findings.append(f"call:{fn}")
+                elif fn in _SANDBOX_REQUIRED_CALLS:
+                    sandbox_findings.append(f"call:{fn}")
+            elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                base = node.func.value.id
+                if base in _SANDBOX_REQUIRED_MODULES:
+                    sandbox_findings.append(f"call:{base}.{node.func.attr}")
+
+    if blocked_findings:
+        unique_blocked = tuple(dict.fromkeys(blocked_findings))
+        return CodeExecutionDecision(
+            allowed_local=False,
+            tier="blocked",
+            reason=f"AST security gate rejected forbidden construct(s): {', '.join(unique_blocked)}.",
+            findings=unique_blocked,
+        )
+
+    if sandbox_findings:
+        unique_sandbox = tuple(dict.fromkeys(sandbox_findings))
+        return CodeExecutionDecision(
+            allowed_local=False,
+            tier="sandbox",
+            reason=f"Code requires isolated sandbox execution due to IO/external module(s): {', '.join(unique_sandbox)}.",
+            findings=unique_sandbox,
+        )
+
+    return CodeExecutionDecision(allowed_local=True, tier="local_ast", reason=None, findings=())
+
+
+def evaluate_code_action_gate(
+    tool_name: str,
+    args: Mapping[str, Any] | dict[str, Any] | None,
+    config: HarnessGuardConfig,
+) -> str | None:
+    """Enforce pre-execution AST gate and two-tier routing on code-action tools."""
+    if not config.code_ast_gate_enabled or tool_name not in _CODE_ACTION_TOOLS:
+        return None
+    safe_args = args if isinstance(args, Mapping) else {}
+    code = safe_args.get("code") or safe_args.get("script") or safe_args.get("source") or ""
+    if not isinstance(code, str):
+        return f"Blocked '{tool_name}': code argument must be a string."
+
+    decision = classify_code_execution_tier(code, allowed_imports=config.allowed_local_python_imports)
+    if decision.tier == "blocked":
+        return f"Blocked '{tool_name}': {decision.reason}"
+    if decision.tier == "sandbox":
+        requested_tier = str(safe_args.get("execution_tier") or safe_args.get("target") or "").strip().lower()
+        if requested_tier != "sandbox":
+            return f"Blocked '{tool_name}': {decision.reason} Route to isolated sandbox instead of local execution."
+    return None
+
+
 def evaluate_constraint_tool_gate(
     tool_name: str,
     args: Mapping[str, Any] | dict[str, Any] | None,
@@ -128,6 +310,11 @@ def evaluate_constraint_tool_gate(
                 for prefix in blocked:
                     if seg == prefix or seg.startswith(prefix + " ") or seg.startswith(prefix + "/"):
                         return f"Blocked '{tool_name}': command segment '{seg}' matches forbidden prefix '{prefix}'."
+
+    # 4. Code-as-Action AST gate & two-tier routing
+    code_denial = evaluate_code_action_gate(tool_name, safe_args, config)
+    if code_denial is not None:
+        return code_denial
 
     return None
 

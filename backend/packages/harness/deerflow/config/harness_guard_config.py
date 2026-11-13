@@ -91,6 +91,19 @@ class HarnessGuardConfig(BaseModel):
         ge=0,
         description="Maximum consecutive premature stop attempts blocked by an active SOP state machine before surfacing loop_capped (0 disables Stop Gate)",
     )
+    code_ast_gate_enabled: bool = Field(
+        default=True,
+        description="Whether to enforce AST static safety checks and two-tier execution routing on code-action tool calls",
+    )
+    allowed_local_python_imports: list[str] = Field(
+        default_factory=lambda: ["collections", "datetime", "functools", "itertools", "json", "math", "re", "statistics", "typing"],
+        description="Pure-memory standard library modules permitted in the local_ast execution tier",
+    )
+    local_python_max_operations: int = Field(
+        default=10000,
+        ge=100,
+        description="Maximum AST evaluation operations permitted per local_ast execution call",
+    )
 
     @model_validator(mode="after")
     def validate_stagnant_readonly_limits(self) -> HarnessGuardConfig:

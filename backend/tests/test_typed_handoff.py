@@ -157,3 +157,47 @@ class TestGoalAncestryPropagation:
         )
         rendered = render_handoff_section(handoff)
         assert "**Goal Ancestry**: Mission A -> Milestone B -> Leaf C" in rendered
+
+    def test_wrap_subagent_callable_inside_local_ast_executor_preserves_handoff_and_ancestry(self):
+        from deerflow.agents.middlewares.local_ast_executor import LocalAstPythonExecutor
+        from deerflow.subagents.typed_handoff import TypedHandoff, wrap_subagent_callable
+
+        seen_calls: list[tuple[str, list[str], str]] = []
+
+        def fake_subagent_invoker(prompt: str, *, goal_ancestry: list[str], ancestry_block: str) -> TypedHandoff:
+            seen_calls.append((prompt, list(goal_ancestry), ancestry_block))
+            # Mutate local copy to verify isolation across calls
+            goal_ancestry.append("mutated-child-goal")
+            return TypedHandoff(
+                status="completed",
+                summary=f"Analyzed {prompt}",
+                next_action="done",
+            )
+
+        subagent_fn = wrap_subagent_callable(
+            fake_subagent_invoker,
+            goal_ancestry=["Root Mission", "Phase 2", "Current Step", "Dropped 4th"],
+        )
+
+        executor = LocalAstPythonExecutor(tools={"analyze": subagent_fn})
+        result = executor.execute(
+            """
+items = ["alpha", "beta"]
+summaries = []
+for name in items:
+    handoff = analyze("item-" + name)
+    summaries.append(handoff.summary)
+final_answer({"count": len(summaries), "summaries": summaries, "ancestry": handoff.goal_ancestry})
+"""
+        )
+        assert result.ok is True
+        assert result.tier == "local_ast"
+        assert result.output == {
+            "count": 2,
+            "summaries": ["Analyzed item-alpha", "Analyzed item-beta"],
+            "ancestry": ["Root Mission", "Phase 2", "Current Step"],
+        }
+        assert len(seen_calls) == 2
+        assert seen_calls[0][1] == ["Root Mission", "Phase 2", "Current Step"]
+        assert seen_calls[1][1] == ["Root Mission", "Phase 2", "Current Step"]
+        assert '<goal_ancestry readonly="true">' in seen_calls[0][2]

@@ -418,3 +418,49 @@ def negotiate_peer_handoffs(
     handoff_a.peer_negotiation = negotiation
     handoff_b.peer_negotiation = negotiation
     return negotiation
+
+
+def wrap_subagent_callable(
+    invoker: Any,
+    *,
+    goal_ancestry: Sequence[str] | None = None,
+    task_ledger: Any | None = None,
+    root_goal: str | None = None,
+    current_milestone: str | None = None,
+) -> Any:
+    """Wrap a subagent invoker into a read-only ancestry-isolated callable.
+
+    Ensures callers (including local AST aggregation loops) pass <=3 read-only
+    goal ancestry items and receive a validated ``TypedHandoff`` contract.
+    """
+    if goal_ancestry is not None:
+        resolved_ancestry = [str(item).strip() for item in goal_ancestry if str(item).strip()][:3]
+    else:
+        resolved_ancestry = build_goal_ancestry(
+            task_ledger,
+            current_milestone=current_milestone,
+            root_goal=root_goal,
+            max_levels=3,
+        )
+    ancestry_block = render_goal_ancestry_block(resolved_ancestry)
+
+    def _call(prompt: str, **kwargs: Any) -> TypedHandoff:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Subagent prompt must be a non-empty string.")
+        raw = invoker(
+            prompt,
+            goal_ancestry=list(resolved_ancestry),
+            ancestry_block=ancestry_block,
+            **kwargs,
+        )
+        if isinstance(raw, TypedHandoff):
+            handoff = raw
+        else:
+            handoff = parse_typed_handoff(None if raw is None else str(raw))
+        if not handoff.goal_ancestry and resolved_ancestry:
+            handoff.goal_ancestry = list(resolved_ancestry)
+        else:
+            handoff.goal_ancestry = list(handoff.goal_ancestry)[:3]
+        return handoff
+
+    return _call

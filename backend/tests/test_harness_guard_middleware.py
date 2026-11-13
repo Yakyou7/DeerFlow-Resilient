@@ -1018,3 +1018,181 @@ class TestConstraintAndSOPToolGates:
         )
         assert context["stop_reason"] == "loop_capped"
         assert mw.consume_stop_reason("sop-cap-run") == "loop_capped"
+
+
+class TestCodeAstGateAndLocalExecutor:
+    def test_classify_code_execution_tier_routing_and_blocks(self):
+        from deerflow.agents.middlewares.harness_tool_gates import classify_code_execution_tier
+
+        # Pure-memory math & whitelisted stdlib -> local_ast
+        safe = classify_code_execution_tier(
+            "import json, math\nitems = [math.sqrt(x) for x in [4, 9]]\nfinal_answer(json.dumps(items))"
+        )
+        assert safe.tier == "local_ast"
+        assert safe.allowed_local is True
+        assert safe.findings == ()
+
+        # IO / OS / non-whitelisted import -> downgrade to sandbox
+        for snippet in (
+            "with open('data.txt', 'r') as f:\n    x = f.read()",
+            "import os\nx = os.getcwd()",
+            "import subprocess\nsubprocess.run(['echo', 'hi'])",
+            "from pathlib import Path\np = Path('.')",
+            "import requests\nr = requests.get('https://example.com')",
+        ):
+            decision = classify_code_execution_tier(snippet)
+            assert decision.tier == "sandbox", snippet
+            assert decision.allowed_local is False
+            assert decision.findings
+
+        # Dangerous code-eval / dunder escapes / syntax errors -> blocked
+        for bad in (
+            "__import__('os').system('id')",
+            "eval('1 + 1')",
+            "exec('x = 1')",
+            "getattr(object, '__subclasses__')()",
+            "x = ().__class__.__base__.__subclasses__()",
+            "def broken(:\n    pass",
+        ):
+            decision = classify_code_execution_tier(bad)
+            assert decision.tier == "blocked", bad
+            assert decision.allowed_local is False
+
+    def test_middleware_wrap_and_awrap_enforce_two_tier_code_gate(self):
+        import asyncio
+
+        mw = HarnessGuardMiddleware(
+            config=HarnessGuardConfig(enabled=True, code_ast_gate_enabled=True)
+        )
+        calls: list[str] = []
+
+        def ok_handler(req: ToolCallRequest) -> ToolMessage:
+            calls.append(req.tool_call["name"])
+            return ToolMessage(
+                content="ok",
+                tool_call_id=req.tool_call["id"],
+                name=req.tool_call["name"],
+            )
+
+        async def async_ok_handler(req: ToolCallRequest) -> ToolMessage:
+            calls.append(f"async:{req.tool_call['name']}")
+            return ToolMessage(
+                content="ok",
+                tool_call_id=req.tool_call["id"],
+                name=req.tool_call["name"],
+            )
+
+        # 1. Pure-memory code allowed locally
+        res_local = mw.wrap_tool_call(
+            _make_request("execute_python", {"code": "x = sum([1, 2, 3])\nfinal_answer(x)"}),
+            ok_handler,
+        )
+        assert res_local.status != "error"
+        assert calls == ["execute_python"]
+
+        # 2. IO/OS code without explicit sandbox tier is blocked for local execution
+        res_need_sandbox = mw.wrap_tool_call(
+            _make_request("execute_python", {"code": "import os\nfinal_answer(os.name)"}),
+            ok_handler,
+        )
+        assert res_need_sandbox.status == "error"
+        assert len(calls) == 1
+
+        # 3. Same IO/OS code with explicit execution_tier='sandbox' is allowed
+        res_sandbox = mw.wrap_tool_call(
+            _make_request(
+                "code_action",
+                {"code": "import os\nprint(os.name)", "execution_tier": "sandbox"},
+            ),
+            ok_handler,
+        )
+        assert res_sandbox.status != "error"
+        assert calls == ["execute_python", "code_action"]
+
+        # 4. Dangerous eval/__import__ remains blocked even with execution_tier='sandbox'
+        res_blocked_sync = mw.wrap_tool_call(
+            _make_request(
+                "execute_python",
+                {"code": "__import__('os').system('whoami')", "execution_tier": "sandbox"},
+            ),
+            ok_handler,
+        )
+        assert res_blocked_sync.status == "error"
+
+        res_blocked_async = asyncio.run(
+            mw.awrap_tool_call(
+                _make_request("code_action", {"code": "eval('1+1')"}),
+                async_ok_handler,
+            )
+        )
+        assert res_blocked_async.status == "error"
+
+        res_ok_async = asyncio.run(
+            mw.awrap_tool_call(
+                _make_request("code_action", {"code": "final_answer(2 + 3)"}),
+                async_ok_handler,
+            )
+        )
+        assert res_ok_async.status != "error"
+        assert "async:code_action" in calls
+
+    def test_local_ast_executor_aggregation_caps_and_sandbox_fallback(self):
+        from deerflow.agents.middlewares.local_ast_executor import LocalAstPythonExecutor
+
+        executor = LocalAstPythonExecutor(max_operations=50)
+
+        # Pure-memory aggregation + print capture + final_answer
+        agg = executor.execute(
+            """
+import json
+total = 0
+for row in rows:
+    if row["active"]:
+        total += row["score"]
+print("total=", total)
+final_answer(json.loads(json.dumps({"total": total})))
+""",
+            variables={"rows": [{"active": True, "score": 10}, {"active": False, "score": 99}, {"active": True, "score": 5}]},
+        )
+        assert agg.ok is True
+        assert agg.tier == "local_ast"
+        assert agg.output == {"total": 15}
+        assert "total= 15" in agg.stdout
+
+        # Operation cap blocks infinite/large loops
+        capped = executor.execute("x = 0\nfor i in range(200):\n    x += i\nfinal_answer(x)")
+        assert capped.ok is False
+        assert capped.error is not None
+
+        # Runtime dunder/underscore attribute guard
+        dunder = executor.execute(
+            "x = obj._secret",
+            variables={"obj": type("Box", (), {"_secret": "nope"})()},
+        )
+        assert dunder.ok is False
+        assert dunder.error is not None
+
+        # Mandatory downgrade to sandbox_runner when IO/external import is needed
+        routed_calls: list[str] = []
+
+        def fake_sandbox(code: str) -> str:
+            routed_calls.append(code)
+            return "sandbox-result"
+
+        downgraded = executor.execute("import os\nprint(os.name)", sandbox_runner=fake_sandbox)
+        assert downgraded.ok is True
+        assert downgraded.tier == "sandbox"
+        assert downgraded.output == "sandbox-result"
+        assert len(routed_calls) == 1
+
+        # Refuses sandbox-tier code if no sandbox_runner is provided
+        refused = executor.execute("import os\nprint(os.name)")
+        assert refused.ok is False
+        assert refused.tier == "sandbox"
+        assert refused.error is not None
+
+        # Blocked code never invokes sandbox_runner
+        blocked = executor.execute("eval('1+1')", sandbox_runner=fake_sandbox)
+        assert blocked.ok is False
+        assert blocked.tier == "blocked"
+        assert len(routed_calls) == 1
