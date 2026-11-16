@@ -39,6 +39,7 @@ from deerflow.agents.middlewares.pii_redaction_middleware import redact_text
 from deerflow.agents.middlewares.todo_middleware import TODO_REMINDER_MESSAGE_NAME
 from deerflow.agents.middlewares.tool_call_args import pair_tool_call_results
 from deerflow.agents.middlewares.tool_output_budget_middleware import TOOL_OUTPUT_BLOB_KEY, _keep_exit_marker_last
+from deerflow.agents.middlewares.tool_result_meta import TOOL_META_KEY
 from deerflow.agents.middlewares.tool_transform_meta import append_tool_transform, read_tool_transforms
 from deerflow.config.app_config import get_app_config
 from deerflow.config.summarization_config import DEFAULT_KEEP
@@ -63,8 +64,7 @@ _SUMMARY_CHUNK_RETRY_CACHE: OrderedDict[str, tuple[float, int]] = OrderedDict()
 _SUMMARY_CHUNK_RETRY_LOCK = threading.Lock()
 _SHORTENED_SUMMARY_MARKER = "\n[summary shortened]\n"
 _EXTERNALIZED_HEADER_RE = re.compile(
-    r"^(\[Full [^\r\n]+ output saved to ([^\r\n]+?) \(\d[\d,]* chars, ~\d[\d,]* tokens\)\.\])",
-    re.MULTILINE,
+    r"\A(\[Full [^\r\n]+ output saved to ([^\r\n]+?) \(\d[\d,]* chars, ~\d[\d,]* tokens\)\.\])",
 )
 _EXTERNALIZED_ACCESS_RE = re.compile(
     r"^- Use read_file on ([^\r\n]+?) with start_line and end_line to inspect the raw output\.",
@@ -215,7 +215,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._prune_tool_outputs = prune_tool_outputs
+        self._prune_tool_outputs = bool(prune_tool_outputs)
         self._max_tool_output_chars = max_tool_output_chars
         self._keep_recent_tool_turns = keep_recent_tool_turns
         run_model = self.model
@@ -295,8 +295,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             "keep": plain_size(self.keep),
             "trim_tokens_to_summarize": self.trim_tokens_to_summarize,
             "prune_tool_outputs": self._prune_tool_outputs,
-            "max_tool_output_chars": self._max_tool_output_chars,
-            "keep_recent_tool_turns": self._keep_recent_tool_turns,
+            "max_tool_output_chars": self._max_tool_output_chars if self._prune_tool_outputs else None,
+            "keep_recent_tool_turns": self._keep_recent_tool_turns if self._prune_tool_outputs else None,
             "source_coverage": "chronological_chunks",
             "max_summary_chunks": _MAX_SUMMARY_CHUNKS,
             "chunk_limit_retry_seconds": _SUMMARY_CHUNK_RETRY_SECONDS,
@@ -1142,6 +1142,17 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         return remaining, rescued + preserved_messages
 
     @staticmethod
+    def _is_error_tool_message(message: ToolMessage) -> bool:
+        """Check both ToolMessage.status and authoritative deerflow_tool_meta status."""
+        if getattr(message, "status", None) == "error":
+            return True
+        kwargs = getattr(message, "additional_kwargs", None)
+        if not isinstance(kwargs, Mapping):
+            return False
+        meta = kwargs.get(TOOL_META_KEY)
+        return isinstance(meta, Mapping) and meta.get("status") == "error"
+
+    @staticmethod
     def _fold_externalized_text(
         text: str,
         *,
@@ -1158,11 +1169,15 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         if header_match is None and access_match is None:
             return None
 
-        virtual_path = (header_match.group(2) if header_match is not None else None) or (access_match.group(1) if access_match is not None else None) or blob_vpath
+        # Prefer server-authored blob metadata over text-extracted paths when present.
+        virtual_path = blob_vpath or (header_match.group(2) if header_match is not None else None) or (access_match.group(1) if access_match is not None else None)
         if not virtual_path:
             return None
 
-        header = header_match.group(1) if header_match is not None else f"[Full {tool_name} output saved to {virtual_path} ({len(text)} chars, ~{len(text) // 4} tokens).]"
+        if header_match is not None and header_match.group(2) == virtual_path:
+            header = header_match.group(1)
+        else:
+            header = f"[Full {tool_name} output saved to {virtual_path} ({len(text)} chars, ~{len(text) // 4} tokens).]"
         folded = f"{header}\n[Preview folded during compaction]\nAccess:\n- Use read_file on {virtual_path} with start_line and end_line to inspect the raw output."
         folded = _keep_exit_marker_last(text, folded, tool_name=tool_name)
         if len(folded) >= len(text):
@@ -1202,28 +1217,33 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return (folded, True) if folded is not None else (content, False)
 
         if isinstance(content, list):
-            text_pieces: list[str] = []
-            retained: list[Any] = []
+            changed = False
+            new_content: list[Any] = []
             for part in content:
                 if isinstance(part, str):
-                    text_pieces.append(part)
+                    folded = cls._fold_externalized_text(
+                        part,
+                        max_chars=max_chars,
+                        tool_name=name,
+                        blob_vpath=blob_vpath,
+                    )
+                    if folded is not None:
+                        changed = True
+                        new_content.append(folded)
+                        continue
                 elif isinstance(part, Mapping) and isinstance(part.get("text"), str) and part.get("type", "text") == "text":
-                    text_pieces.append(part["text"])
-                else:
-                    retained.append(part)
-            combined_text = "\n".join(text_pieces) if len(text_pieces) > 1 else (text_pieces[0] if text_pieces else "")
-            if not combined_text:
-                return content, False
-            folded = cls._fold_externalized_text(
-                combined_text,
-                max_chars=max_chars,
-                tool_name=name,
-                blob_vpath=blob_vpath,
-            )
-            if folded is None:
-                return content, False
-            new_content: list[Any] = [{"type": "text", "text": folded}, *retained] if retained else [{"type": "text", "text": folded}]
-            return new_content, True
+                    folded = cls._fold_externalized_text(
+                        part["text"],
+                        max_chars=max_chars,
+                        tool_name=name,
+                        blob_vpath=blob_vpath,
+                    )
+                    if folded is not None:
+                        changed = True
+                        new_content.append({**part, "text": folded})
+                        continue
+                new_content.append(part)
+            return (new_content, True) if changed else (content, False)
 
         return content, False
 
@@ -1256,7 +1276,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
         result: list[AnyMessage] = []
         for i, m in enumerate(preserved_messages):
-            if i in protected_indices or not isinstance(m, ToolMessage) or getattr(m, "status", None) == "error":
+            if i in protected_indices or not isinstance(m, ToolMessage) or self._is_error_tool_message(m):
                 result.append(m)
                 continue
 
@@ -1265,7 +1285,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 result.append(m)
                 continue
 
-            kwargs = getattr(m, "additional_kwargs", None) or {}
+            raw_kwargs = getattr(m, "additional_kwargs", None)
+            kwargs: Mapping[str, Any] = raw_kwargs if isinstance(raw_kwargs, Mapping) else {}
             blob_meta = kwargs.get(TOOL_OUTPUT_BLOB_KEY)
             blob_vpath = blob_meta.get("virtual_path") if isinstance(blob_meta, Mapping) and isinstance(blob_meta.get("virtual_path"), str) else None
             has_ext_transform = any(tr.get("kind") == "externalized" for tr in transforms)

@@ -141,6 +141,11 @@ summarization:
   # Custom summary prompt (optional)
   summary_prompt: null
 
+  # Opt-in folding of older externalized ToolMessage previews in kept history
+  prune_tool_outputs: false
+  max_tool_output_chars: 300
+  keep_recent_tool_turns: 2
+
   # Tool names treated as skill file reads for the durable skill_context channel
   skill_file_read_tool_names:
     - read_file
@@ -245,6 +250,21 @@ keep:
 - **Type**: String or null
 - **Default**: `null` (uses DeerFlow's built-in prompt)
 - **Description**: Custom prompt template for generating summaries. The prompt should guide the model to extract the most important context.
+
+#### `prune_tool_outputs`
+- **Type**: Boolean
+- **Default**: `false`
+- **Description**: Opt-in flag to fold older externalized `ToolMessage` previews in `preserved_messages` down to compact file-reference pointers during compaction (`compact_state` / `acompact_state`). Non-compaction turns are untouched, un-externalized payloads are never truncated, and error tool results (both `ToolMessage.status == "error"` and `deerflow_tool_meta.status == "error"`) remain intact.
+
+#### `max_tool_output_chars`
+- **Type**: Integer (`>= 50`)
+- **Default**: `300`
+- **Description**: Minimum preview character length required to trigger folding for older externalized `ToolMessage` entries. This is a trigger threshold rather than a hard output cap (folded pointers carrying SHA-256 `.tool-results` paths are roughly 400 characters; folding only applies when the folded pointer is shorter than the original preview).
+
+#### `keep_recent_tool_turns`
+- **Type**: Integer (`>= 0`)
+- **Default**: `2`
+- **Description**: Number of most recent tool execution turns in the preserved tail whose externalized previews remain unfolded. Turns are grouped by issuing `AIMessage` occurrence so providers that reuse `tool_call_id` values across turns keep distinct boundaries.
 
 #### `skill_file_read_tool_names`
 - **Type**: List of strings

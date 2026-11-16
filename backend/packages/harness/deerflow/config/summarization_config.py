@@ -104,7 +104,7 @@ class SummarizationConfig(BaseModel):
     max_tool_output_chars: int = Field(
         default=300,
         ge=50,
-        description="Maximum un-folded character length for older externalized ToolMessages in preserved history; previews above this length fold to their externalized file-reference pointer.",
+        description=("Minimum preview character length required to trigger folding for older externalized ToolMessages in preserved history (a trigger threshold, not a hard output cap: folded pointers with SHA-256 paths are ~400 chars)."),
     )
     keep_recent_tool_turns: int = Field(
         default=2,

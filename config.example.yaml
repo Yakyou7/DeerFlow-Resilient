@@ -2342,6 +2342,15 @@ summarization:
   # The prompt should guide the model to extract important context
   summary_prompt: null
 
+  # Opt-in folding of older externalized ToolMessage previews in the retained
+  # compaction tail down to compact file-reference pointers (default: false).
+  # Only previews above max_tool_output_chars (threshold, not a hard output cap;
+  # folded SHA-256 pointers are ~400 chars) outside the newest
+  # keep_recent_tool_turns tool turns are folded; error results stay intact.
+  prune_tool_outputs: false
+  max_tool_output_chars: 300
+  keep_recent_tool_turns: 2
+
   # Loaded SKILL.md references (read_file calls under skills.container_path) are
   # captured into the durable skill_context channel and re-injected after
   # compaction as name/path/description reminders. The full skill body is not
